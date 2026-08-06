@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rikkelivo"
+version = "0.1.0"
+description = "Bidirectional backup converter between RikkaHub and Kelivo (independent Android chat apps)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "click>=8.1",
+    "rich>=13.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+rikkelivo = "rikkelivo.cli:entrypoint"
+
+[tool.setuptools.packages.find]
+where = ["src"]
