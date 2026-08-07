@@ -45,3 +45,28 @@ rikkelivo to-kelivo rikkahub_backup_20260806_134946.zip --force
 ```bash
 $ uv run pytest
 ```
+
+## 自动构建
+
+推送任意分支或手动触发（Actions → Run workflow）时，GitHub Actions 会用
+Nuitka 构建 5 个平台的单文件二进制（`linux-amd64`、`linux-arm64`、
+`windows-amd64`、`darwin-amd64`、`darwin-arm64`），构建后执行 `--help`
+冒烟检查并上传产物，见 `.github/workflows/nuitka-build.yml`。
+
+本机构建：
+
+```bash
+uv sync --all-groups
+scripts/build.sh       # Linux / macOS → build/linux|macos/rikkelivo
+scripts/build.ps1      # Windows → build\win\rikkelivo.exe
+```
+
+Linux 构建需 `patchelf`，macOS/Windows 不需要；产物为 Nuitka onefile，
+不依赖目标机器安装 Python。
+
+NixOS 等非常规发行版或需要 glibc 兼容面时，用 Docker 容器构建：
+
+```bash
+scripts/build-in-container.sh              # ubuntu:22.04 (glibc 2.35) → dist/rikkelivo
+scripts/build-in-container.sh --cleanup    # 构建后删除复用的构建容器
+```

@@ -18,6 +18,10 @@ dependencies = [
 dev = [
     "pytest>=8.0",
 ]
+build = [
+    "nuitka>=2.0",
+    "zstandard>=0.22",
+]
 
 [project.scripts]
 rikkelivo = "rikkelivo.cli:entrypoint"

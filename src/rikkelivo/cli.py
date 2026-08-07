@@ -93,6 +93,14 @@ def _finish(kind: str, out: Path, summary: str, notes: list[str],
 
 
 def entrypoint() -> None:
+    # Windows 控制台/管道常为 cp1252 等非 UTF-8 编码，中文输出会触发
+    # UnicodeEncodeError（如 `--help` 直接崩溃）。强制 UTF-8 输出，
+    # 无法编码时用替换符兜底而不是中断。
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
     try:
         main(standalone_mode=False)
     except click.ClickException as exc:
