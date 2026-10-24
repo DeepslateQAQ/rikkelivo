@@ -13,7 +13,7 @@
 
 ## 下载
 
-GitHub Actions 用 Nuitka 构建单文件二进制。下面的 [Nightly.link](https://nightly.link/) 链接指向 `master` 最新一次成功构建，解压即用：
+GitHub Actions 用 Nuitka 构建单文件二进制。下面的 [Nightly.link](https://nightly.link/) 链接指向 `master` 最新一次成功构建。Linux / macOS 解压后先执行 `chmod +x rikkelivo`，Windows 直接运行 `rikkelivo.exe`：
 
 | 平台 | 产物 | 下载 |
 | --- | --- | --- |
@@ -57,7 +57,8 @@ uv run rikkelivo backup.zip --to kelivo
 uv run rikkelivo backup.zip --to rikkahub --legacy -o out.zip
 uv run rikkelivo backup.zip --to cuplivo --force
 
-# 或者直接用下载的单文件（Windows 下是 .\rikkelivo.exe）
+# 或者直接用下载的单文件（Windows 下跳过 chmod，运行 .\rikkelivo.exe）
+chmod +x rikkelivo
 ./rikkelivo backup.zip --to kelivo
 
 # 只给输入路径，进入交互向导
