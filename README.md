@@ -1,4 +1,6 @@
-# rikkelivo
+![Banner](banner.svg)
+
+# Rikkelivo
 
 [![Nuitka build](https://github.com/DeepslateQAQ/rikkelivo/actions/workflows/nuitka-build.yml/badge.svg?branch=master)](https://github.com/DeepslateQAQ/rikkelivo/actions/workflows/nuitka-build.yml)
 
