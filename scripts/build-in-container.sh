@@ -37,5 +37,5 @@ fi
 # uv 托管 Python（3.13）满足 requires-python，且比系统 python3.10 新
 UV='export PATH=/root/.local/bin:$PATH; cd /work && mkdir -p dist && uv run --frozen'
 
-docker exec "$NAME" bash -lc "$UV --group build nuitka --onefile --assume-yes-for-downloads --no-deployment-flag=self-execution --output-filename=/work/dist/rikkelivo --remove-output --jobs=$JOBS src/rikkelivo/cli.py"
+docker exec "$NAME" bash -lc "$UV --group build nuitka --onefile --assume-yes-for-downloads --no-deployment-flag=self-execution --output-filename=/work/dist/rikkelivo --remove-output --jobs=$JOBS --include-package=rikkelivo --include-package=click --include-package=rich --include-package=questionary --include-package=prompt_toolkit --include-package=wcwidth --include-package-data=rikkelivo src/rikkelivo/cli.py"
 echo "构建完成: $(pwd)/dist/rikkelivo"

@@ -25,30 +25,35 @@ jobs:
             build: scripts/build.sh
             artifact: build/linux/rikkelivo
             check: ./build/linux/rikkelivo --help
+            version: ./build/linux/rikkelivo --version
             deps: patchelf ccache
           - target: linux-arm64
             runs-on: ubuntu-22.04-arm
             build: scripts/build.sh
             artifact: build/linux/rikkelivo
             check: ./build/linux/rikkelivo --help
+            version: ./build/linux/rikkelivo --version
             deps: patchelf ccache
           - target: windows-amd64
             runs-on: windows-2022
             build: powershell -ExecutionPolicy Bypass -File scripts/build.ps1
             artifact: build/win/rikkelivo.exe
             check: .\build\win\rikkelivo.exe --help
+            version: .\build\win\rikkelivo.exe --version
             deps: ""
           - target: darwin-amd64
             runs-on: macos-15-intel # Intel
             build: scripts/build.sh
             artifact: build/macos/rikkelivo
             check: ./build/macos/rikkelivo --help
+            version: ./build/macos/rikkelivo --version
             deps: ""
           - target: darwin-arm64
             runs-on: macos-latest # Apple Silicon
             build: scripts/build.sh
             artifact: build/macos/rikkelivo
             check: ./build/macos/rikkelivo --help
+            version: ./build/macos/rikkelivo --version
             deps: ""
 
     steps:
@@ -80,8 +85,11 @@ jobs:
       - name: Build single-file binary (${{ matrix.target }})
         run: ${{ matrix.build }}
 
-      - name: Check build artifact
+      - name: Check build artifact (help)
         run: ${{ matrix.check }}
+
+      - name: Check build artifact (version)
+        run: ${{ matrix.version }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7

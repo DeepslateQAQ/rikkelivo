@@ -1,26 +1,11 @@
-"""Settings bridge between RikkaHub and Kelivo (cuplivo) settings files.
+"""Single settings conversion for every supported direction.
 
-The two apps are independent projects with different settings schemas, so this
-bridge is best-effort by design:
-
-- Keys that exist in both apps with the same name and value type are copied
-  verbatim (verified byte-identical in the reference backups).
-- RikkaHub stores providers/assistants/mcpServers/TTS/quick phrases/mode
-  injections as native JSON lists; Kelivo (cuplivo) stores the same concepts
-  as JSON-stringified preference values (`provider_configs_v1`,
-  `assistants_v1`, `mcp_servers_v1`, `tts_services_v1`, `quick_phrases_v1`,
-  `instruction_injections_v1`).  The bridge converts between the two with
-  per-field mappings harvested from both apps' sources (kotlinx-serialization
-  data classes for RikkaHub, ProviderConfig/Assistant toJson for Kelivo).
-- Target-only keys are filled with the target app's own defaults so the
-  resulting settings.json is structurally complete.
-
-RikkaHub restores settings leniently (Json { ignoreUnknownKeys = true;
-encodeDefaults = true }), so converted entries must only avoid wrong *types*
-and invalid enum/discriminator values.
-
-Every conversion returns (settings_dict, notes) where notes is a list of
-human-readable warnings about lossy mappings.
+The bridge produces the target's native settings payload *and* the identifier
+maps the chat projection needs, in one pass: providers and models are paired by
+(provider key, logical model id), assistants and services by their native ids,
+and memory is projected under the target's own permission model.  A target
+reference is only kept when it resolves; anything that cannot be expressed is
+dropped and reported, never silently rebound to a same-named sibling.
 """
 
 from __future__ import annotations
@@ -28,311 +13,99 @@ from __future__ import annotations
 import json
 import re
 import uuid as uuidlib
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
-# ---------------------------------------------------------------------------
-# Shared keys: copied verbatim (same name, same JSON type in both apps)
-# ---------------------------------------------------------------------------
-# Prompt-bearing shared keys: their placeholder variables need rewriting.
-_PROMPT_KEYS = ("titlePrompt", "translatePrompt", "suggestionPrompt",
-                "ocrPrompt", "compressPrompt")
-SHARED_KEYS: tuple[str, ...] = (
-    "themeId", "customThemes", "developerMode", "dynamicColor",
-    "favoriteModels", "chatModelId", "fastModelId", "imageGenerationModelId",
-    "titlePrompt", "translateModeId", "translatePrompt",
-    "translateThinkingBudget", "enableSuggestion", "suggestionPrompt",
-    "ocrModelId", "ocrPrompt", "compressModelId", "compressPrompt",
-    "assistantId", "assistantTags", "defaultTTSPlaybackSpeed",
-    "launchCount", "sponsorAlertDismissedAt", "searchServiceSelected",
-    "selectedTTSProviderId", "selectedASRProviderId",
-    "webServerEnabled", "webServerPort", "webServerJwtEnabled",
-    "webServerAccessPassword", "webServerLocalhostOnly",
-    "searchServices", "asrProviders", "lorebooks",
+from rikkelivo import model
+from rikkelivo.model import (
+    AssistantMemoryFlags,
+    Backup,
+    Diagnostic,
+    KelivoPayload,
+    MemoryDoc,
+    MemoryEntry,
+    RikkaPayload,
+    SettingsResult,
+    TargetProfile,
 )
+from rikkelivo.times import iso_to_ms, ms_to_iso
 
 # ---------------------------------------------------------------------------
-# RikkaHub-side constants (harvested from rikkahub source / reference backup)
+# Constants
 # ---------------------------------------------------------------------------
+
+RH_DEFAULT_ASSISTANT_ID = "0950e2dc-9bd5-4801-afa3-aa887aa36b4e"
 RH_FILES_PREFIX = "file:///data/user/0/me.rerere.rikkahub/files/"
 RH_AVATAR_DUMMY = {"type": "me.rerere.rikkahub.data.model.Avatar.Dummy"}
 
-RH_DISPLAY_DEFAULTS: dict[str, Any] = {
-    "userAvatar": RH_AVATAR_DUMMY,
-    "userNickname": "",
-    "useAppIconStyleLoadingIndicator": True,
-    "showUserAvatar": True,
-    "showAssistantBubble": False,
-    "bubbleOpacity": 1.0,
-    "showModelIcon": True,
-    "showModelName": True,
-    "showDateTimeInMessage": False,
-    "showTokenUsage": True,
-    "showThinkingContent": True,
-    "autoCloseThinking": True,
-    "showUpdates": True,
-    "showMessageJumper": True,
-    "messageJumperOnLeft": False,
-    "fontSizeRatio": 1.0,
-    "enableMessageGenerationHapticEffect": False,
-    "skipCropImage": True,
-    "enableNotificationOnMessageGeneration": False,
-    "enableLiveUpdateNotification": False,
-    "codeBlockAutoWrap": False,
-    "codeBlockAutoCollapse": False,
-    "showLineNumbers": False,
-    "ttsOnlyReadQuoted": False,
-    "ttsOnlyReadOutsideBrackets": False,
-    "autoPlayTTSAfterGeneration": False,
-    "pasteLongTextAsFile": False,
-    "pasteLongTextThreshold": 1000,
-    "sendOnEnter": False,
-    "enableAutoScroll": True,
-    "enableLatexRendering": True,
-    "enableBlurEffect": False,
-    "chatFontFamily": "default",
-    "chatCustomFontPath": "",
-    "chatCustomFontName": "",
-    "enableVolumeKeyScroll": False,
-    "volumeKeyScrollRatio": 1.0,
-}
-
-RH_ONLY_DEFAULTS: dict[str, Any] = {
-    "titleModelId": None,
-    "suggestionModelId": None,
-    "displaySetting": RH_DISPLAY_DEFAULTS,
-    "searchCommonOptions": {"resultSize": 10},
-    "webDavConfig": {"url": "", "username": "", "password": "",
-                     "path": "rikkahub_backups", "items": ["DATABASE", "FILES"]},
-    "s3Config": {"endpoint": "", "accessKeyId": "", "secretAccessKey": "",
-                 "bucket": "", "region": "auto", "pathStyle": True,
-                 "items": ["DATABASE", "FILES"]},
-    "backupReminderConfig": {"enabled": False, "intervalDays": 7,
-                             "lastBackupTime": 0},
-    "modeInjections": [],
-    "quickMessages": [],
-    "providers": [],
-    "assistants": [],
-    "mcpServers": [],
-    "ttsProviders": [],
-}
-
-RH_ASSISTANT_DEFAULTS: dict[str, Any] = {
-    "tags": [],
-    "contextMessageLimit": 0,
-    "useGlobalMemory": False,
-    "presetMessages": [],
-    "quickMessageIds": [],
-    "regexes": [],
-    "reasoningLevel": "auto",
-    "customHeaders": [],
-    "customBodies": [],
-    "mcpServers": [],
-    "localTools": ["time_info"],
-    "enableWebSearch": False,
-    "workspaceId": None,
-    "backgroundOpacity": 1.0,
-    "useGradientBackground": False,
-    "modeInjectionIds": [],
-    "lorebookIds": [],
-    "enabledSkills": [],
-    "enableTimeReminder": False,
-    "allowConversationSystemPrompt": False,
-    "allowConversationPromptInjection": False,
-}
-
-RH_PROVIDER_DEFAULTS: dict[str, Any] = {
-    "type": "openai",
-    "enabled": True,
-    "apiKey": "",
-    "baseUrl": "https://api.openai.com/v1",
-    "chatCompletionsPath": "/chat/completions",
-    "useResponseApi": False,
-    "includeHistoryReasoning": True,
-    "balanceOption": {"enabled": False, "apiPath": "/credits",
-                      "resultPath": "data.total_usage"},
-}
-
-RH_MODEL_DEFAULTS: dict[str, Any] = {
-    "type": "CHAT",
-    "customHeaders": [],
-    "customBodies": [],
-    "inputModalities": ["TEXT"],
-    "outputModalities": ["TEXT"],
-    "abilities": ["TOOL"],
-    "tools": [],
-    "providerOverwrite": None,
-}
-
-# ---------------------------------------------------------------------------
-# Kelivo-side constants (harvested from cuplivo source / reference backup)
-# ---------------------------------------------------------------------------
-KL_ONLY_DEFAULTS: dict[str, Any] = {
-    "android_background_chat_mode_v1": "on_notify",
-    "app_launch_count_v1": 3,
-    "app_locale_v1": "system",
-    "display_app_font_family_v1": "Noto Serif SC",
-    "display_app_font_is_google_v1": True,
-    "display_code_font_family_v1": "Ubuntu Mono",
-    "display_code_font_is_google_v1": True,
-    "display_collapse_thinking_steps_v1": True,
-    "display_show_tool_result_summary_v1": True,
-    "suggestion_insert_on_tap_only_v1": True,
-    "display_new_chat_on_assistant_switch_v1": True,
-    "display_new_chat_after_delete_v1": True,
-    "display_auto_collapse_code_block_v1": True,
-    "display_use_new_assistant_avatar_ux_v1": True,
-    "display_show_provider_in_chat_message_v1": True,
-    "display_auto_collapse_code_block_lines_v1": 10,
-    "display_show_chat_list_date_v1": True,
-    "image_cropper_enabled_v1": True,
-    "display_chat_message_background_style_v1": "frosted",
-    "display_haptics_on_generate_v1": True,
-    "display_use_pure_background_v1": False,
-    "display_enter_to_send_on_mobile_v1": False,
-    "display_desktop_show_tray_v1": False,
-    "display_desktop_minimize_to_tray_on_close_v1": False,
-    "global_proxy_bypass_v1":
-        "localhost,127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,::1",
-    "mcp_request_timeout_ms_v1": 30000,
-    "provider_group_collapsed_v1": "{}",
-    "provider_group_map_v1": "{}",
-    "providers_order_v1": ["OpenAI", "SiliconFlow", "Gemini", "OpenRouter",
-                           "KelivoIN", "Tensdaq", "DeepSeek", "AIhubmix",
-                           "Aliyun", "Zhipu AI", "Claude", "Grok",
-                           "ByteDance"],
-    # RikkaHub-shaped mirror keys stay empty, like a fresh Kelivo install
-    # (Kelivo keeps its data in the *_v1 preference strings).
-    "providers": [],
-    "assistants": [],
-    "mcpServers": [],
-    "quickMessages": [],
-    "modeInjections": [],
-    "ttsProviders": [],
-    "searchServices": [],
-    "asrProviders": [],
-    "lorebooks": [],
-    "assistantTags": [],
-    "favoriteModels": [],
-    "customThemes": [],
-}
-
-KL_ASSISTANT_DEFAULTS: dict[str, Any] = {
-    "useAssistantName": True,
-    "chatModelProvider": None,
-    "contextMessageSize": 64,
-    "limitContextMessages": True,
-    "streamOutput": True,
-    "thinkingBudget": 0,
-    "searchEnabled": False,
-    "mcpServerIds": [],
-    "localToolIds": [],
-    "skillIds": [],
-    "background": None,
-    "customHeaders": [],
-    "customBody": [],
-    "enableMemory": True,
-    "memoryMode": "tool",
-    "enableRecentChatsReference": False,
-    "recentChatsSummaryMessageCount": 5,
-    "memoryRecordPrompt": "",
-    "presetMessages": "[]",
-    "regexRules": [],
-    "enableProactiveCare": False,
-    "proactiveCareNextMessageAt": None,
-    "proactiveCarePrompt": "",
-    "proactiveCareDecisionPrompt": "",
-    "docxMode": "extract",
-    "pdfMode": "extract",
-    "otherOfficeMode": "direct",
-    "ocrMode": "auto",
-    "enableTimeInjection": False,
-    "discoverable": False,
-    "handoffId": None,
-    "handoffDescription": None,
-}
-
-KL_PROVIDER_DEFAULTS: dict[str, Any] = {
-    "enableToolResultImages": None,
-    "vertexAI": None,
-    "location": None,
-    "projectId": None,
-    "serviceAccountJson": None,
-    "proxyEnabled": None,
-    "proxyType": None,
-    "proxyHost": None,
-    "proxyPort": None,
-    "proxyUsername": None,
-    "proxyPassword": None,
-    "avatarType": None,
-    "avatarValue": None,
-    "multiKeyEnabled": None,
-    "apiKeys": None,
-    "keyManagement": None,
-    "aihubmixAppCodeEnabled": None,
-    "balanceEnabled": None,
-    "balanceApiPath": None,
-    "balanceResultPath": None,
-    "claudePromptCachingEnabled": False,
-    "claudePromptCachingTtl": "5m",
-    "customHeaders": None,
-    "customBody": None,
-}
-
-# Kelivo ships three built-in in-memory MCP servers (see cuplivo
-# mcp_provider.dart `_ensureBuiltin*ServerPresent`).  They are injected into
-# Kelivo backups converted from RikkaHub (which has no equivalents) and
-# stripped when converting away from Kelivo.
-KL_BUILTIN_MCPS: list[dict[str, Any]] = [
-    {"id": "kelivo_fetch", "enabled": True,
-     "name": "@kelivo/fetch", "transport": "inmemory", "tools": []},
-    {"id": "kelivo_subagent", "enabled": True,
-     "name": "@kelivo/subagent", "transport": "inmemory", "tools": []},
-    {"id": "kelivo_filesystem", "enabled": False,
-     "name": "@kelivo/filesystem", "transport": "inmemory", "tools": []},
-]
-KL_BUILTIN_MCP_IDS = {m["id"] for m in KL_BUILTIN_MCPS}
-KL_BUILTIN_MCP_NAMES = {m["name"] for m in KL_BUILTIN_MCPS}
-
-# Fields the converter keeps when mapping a Kelivo assistant onto the
-# RikkaHub shape (everything else is dropped and reported).
-_RH_ASSISTANT_KEPT = {
-    "id", "name", "avatar", "useAssistantAvatar", "chatModelId",
-    "chatModelProvider", "temperature", "topP", "maxTokens", "background",
-    "streamOutput", "systemPrompt", "messageTemplate", "enableMemory",
-    "enableRecentChatsReference", "customHeaders", "customBody",
-    "presetMessages", "skillIds",
-}
-# Fields kept when mapping a RikkaHub assistant onto the Kelivo shape.
-_KL_ASSISTANT_KEPT = {
-    "id", "name", "avatar", "useAssistantAvatar", "chatModelId",
-    "temperature", "topP", "maxTokens", "background", "streamOutput",
-    "systemPrompt", "messageTemplate", "enableMemory",
-    "enableRecentChatsReference", "customHeaders", "customBodies",
-    "presetMessages", "enabledSkills",
-}
-
-_MODEL_NS = uuidlib.uuid5(uuidlib.NAMESPACE_URL, "rikkelivo-model")
-_PROVIDER_NS = uuidlib.uuid5(uuidlib.NAMESPACE_URL, "rikkelivo-provider")
 _ENTITY_NS = uuidlib.uuid5(uuidlib.NAMESPACE_URL, "rikkelivo-entity")
+_MODEL_NS = uuidlib.uuid5(uuidlib.NAMESPACE_URL, "rikkelivo-model")
+_MEMORY_NS = uuidlib.uuid5(uuidlib.NAMESPACE_URL, "rikkelivo-memory")
 
-# Prompt placeholder variables: RikkaHub renders both `{{key}}` and `{key}`
-# (PlaceholderTransformer.kt replaces both forms) with its own key set;
-# Kelivo (cuplivo) renders only single-brace `{key}` placeholders in
-# system prompts (prompt_transformer.dart buildPlaceholders) and its key set
-# differs: {assistant_name}/{nickname} vs RikkaHub's {char}/{user}, and
-# Kelivo has {cur_time}/{cur_datetime} which RikkaHub lacks.  Message
-# templates use the same `{{ message }}` mustache style in both apps and are
-# left untouched.
-#
-# RikkaHub key -> Kelivo key (keys absent here keep their name; RikkaHub-only
-# keys without a Kelivo counterpart map onto the closest equivalent).
-_PROMPT_VAR_K2K: dict[str, str] = {
+_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+
+_MEMORY_SECTION_ORDER = ("workflow", "voice", "instruction")
+
+
+def _is_uuid(value: Any) -> bool:
+    return isinstance(value, str) and bool(_UUID_RE.match(value))
+
+
+def _entity_uuid(value: Any, namespace: str = "") -> str:
+    if _is_uuid(value):
+        return str(value).lower()
+    seed = f"{namespace}:{value}" if namespace else str(value)
+    return str(uuidlib.uuid5(_ENTITY_NS, seed))
+
+
+def _model_uuid(provider_id: str, logical_id: str) -> str:
+    return str(uuidlib.uuid5(_MODEL_NS, f"{provider_id}:{logical_id}"))
+
+
+def _parse(value: Any) -> Any:
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except (ValueError, TypeError):
+            return None
+    return value
+
+
+def _json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _as_list(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else []
+
+
+def _as_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _diag(code: str, category: str, count: int, detail: str) -> Diagnostic:
+    return Diagnostic(code, category, count, detail)
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _now_ms() -> int:
+    return int(datetime.now().timestamp() * 1000)
+
+
+# ---------------------------------------------------------------------------
+# Prompt placeholders
+# ---------------------------------------------------------------------------
+
+_PROMPT_VAR_K2K = {
     "char": "assistant_name",
     "user": "nickname",
     "cur_date": "cur_date",
-    "cur_time": "cur_time",  # no RikkaHub counterpart; keep name
-    "cur_datetime": "cur_datetime",  # no RikkaHub counterpart; keep name
+    "cur_time": "cur_time",
+    "cur_datetime": "cur_datetime",
     "model_id": "model_id",
     "model_name": "model_name",
     "locale": "locale",
@@ -342,8 +115,7 @@ _PROMPT_VAR_K2K: dict[str, str] = {
     "battery_level": "battery_level",
     "nickname": "nickname",
 }
-# Kelivo key -> RikkaHub key
-_PROMPT_VAR_K2R: dict[str, str] = {
+_PROMPT_VAR_K2R = {
     "assistant_name": "char",
     "nickname": "user",
     "cur_date": "cur_date",
@@ -359,27 +131,18 @@ _PROMPT_VAR_K2R: dict[str, str] = {
     "user": "user",
     "char": "char",
 }
-
-
 _PROMPT_VAR_RE = re.compile(r"(\{\{|\{)([A-Za-z_]+)(\}\}|\})")
 
 
 def convert_prompt_vars(text: str, to_rikkahub: bool) -> str:
-    """Rewrite prompt placeholder variables between the two apps' formats.
-
-    `to_rikkahub=True`: Kelivo `{key}` -> RikkaHub `{{key}}` (single braces
-    also work in RikkaHub, but double is canonical and unambiguous).
-    `to_rikkahub=False`: RikkaHub `{{key}}`/`{key}` -> Kelivo `{key}`.
-    Unknown keys are left verbatim (RikkaHub would render them literally
-    either way; Kelivo tolerates them too).
-    """
+    """Rewrite prompt placeholders between the two applications' syntax."""
     table = _PROMPT_VAR_K2R if to_rikkahub else _PROMPT_VAR_K2K
 
     def _sub(match: re.Match) -> str:
-        open_, key, close = match.group(1), match.group(2), match.group(3)
+        opening, key, closing = match.groups()
         if to_rikkahub:
-            if close == "}}":
-                return match.group(0)  # already double-braced, keep form
+            if closing == "}}":
+                return match.group(0)
             target = table.get(key)
             return f"{{{{{target}}}}}" if target else match.group(0)
         target = table.get(key)
@@ -387,1266 +150,1618 @@ def convert_prompt_vars(text: str, to_rikkahub: bool) -> str:
             return match.group(0)
         return f"{{{target}}}"
 
-    # Single pass; double braces are consumed atomically by the regex.
     return _PROMPT_VAR_RE.sub(_sub, text)
 
-_UUID_RE = re.compile(
-    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def convert_settings(source: Backup, target: TargetProfile) -> SettingsResult:
+    source_family = source.family
+    target_family = model.APP_FAMILY[target.app]
+    if target_family == "kelivo" and source_family == "kelivo":
+        return _kelivo_to_kelivo(source, target)
+    if target_family == "rikkahub" and source_family == "rikkahub":
+        return _rikkahub_to_rikkahub(source)
+    if source_family == "rikkahub":
+        return _rikkahub_to_kelivo(source, target)
+    return _kelivo_to_rikkahub(source, target)
 
 
-def _is_uuid(value: Any) -> bool:
-    return isinstance(value, str) and bool(_UUID_RE.match(value))
+def _rikkahub_to_rikkahub(source: Backup) -> SettingsResult:
+    payload = source.payload
+    assert isinstance(payload, RikkaPayload)
+    settings = dict(payload.settings)
+    providers = _as_list(settings.get("providers"))
+    assistants = _as_list(settings.get("assistants"))
+    return SettingsResult(
+        settings=settings,
+        provider_ids={str(p.get("id")): str(p.get("id"))
+                      for p in providers if isinstance(p, dict) and p.get("id")},
+        assistant_ids={str(a.get("id")): str(a.get("id"))
+                       for a in assistants if isinstance(a, dict) and a.get("id")},
+        workspace_ids={},
+        entity_ids=_rikkahub_entity_ids(settings),
+    )
 
 
-def _entity_uuid(value: Any, namespace: str = "") -> str:
-    """Normalize an arbitrary id to a legal UUID.
-
-    RikkaHub deserializes id fields as kotlin.uuid.Uuid; any non-UUID string
-    (Kelivo uses human-readable ids like "KelivoIN" or "kelivo_fetch") would
-    crash the restore, so ids are mapped deterministically.
-    """
-    if _is_uuid(value):
-        return str(value)
-    seed = f"{namespace}:{value}" if namespace else str(value)
-    return str(uuidlib.uuid5(_ENTITY_NS, seed))
-
-
-# Built-in providers shipped by both apps, matched by (baseUrl, providerType)
-# K->R and by RikkaHub provider UUID R->K.  Reusing the RikkaHub built-in UUID
-# keeps provider ids stable and avoids duplicate provider entries; the
-# RikkaHub ids below match the reference backup's own provider list.
-BUILTIN_PROVIDERS: list[dict[str, str]] = [
-    {"kelivo_key": "OpenAI", "type": "openai",
-     "url": "https://api.openai.com/v1",
-     "rh_id": "1eeea727-9ee5-4cae-93e6-6fb01a4d051e", "rh_name": "OpenAI"},
-    {"kelivo_key": "SiliconFlow", "type": "openai",
-     "url": "https://api.siliconflow.cn/v1",
-     "rh_id": "56a94d29-c88b-41c5-8e09-38a7612d6cf8", "rh_name": "硅基流动"},
-    {"kelivo_key": "Gemini", "type": "google",
-     "url": "https://generativelanguage.googleapis.com/v1beta",
-     "rh_id": "6ab18148-c138-4394-a46f-1cd8c8ceaa6d", "rh_name": "Gemini"},
-    {"kelivo_key": "OpenRouter", "type": "openai",
-     "url": "https://openrouter.ai/api/v1",
-     "rh_id": "d5734028-d39b-4d41-9841-fd648d65440e", "rh_name": "OpenRouter"},
-    {"kelivo_key": "DeepSeek", "type": "openai",
-     "url": "https://api.deepseek.com/v1",
-     "rh_id": "f099ad5b-ef03-446d-8e78-7e36787f780b", "rh_name": "DeepSeek"},
-    {"kelivo_key": "AIhubmix", "type": "openai",
-     "url": "https://aihubmix.com/v1",
-     "rh_id": "1b1395ed-b702-4aeb-8bc1-b681c4456953", "rh_name": "AiHubMix"},
-    {"kelivo_key": "Aliyun", "type": "openai",
-     "url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-     "rh_id": "f76cae46-069a-4334-ab8e-224e4979e58c", "rh_name": "阿里云百炼"},
-    {"kelivo_key": "Zhipu AI", "type": "openai",
-     "url": "https://open.bigmodel.cn/api/paas/v4",
-     "rh_id": "3bc40dc1-b11a-46fa-863b-6306971223be", "rh_name": "智谱AI开放平台"},
-    {"kelivo_key": "Grok", "type": "openai",
-     "url": "https://api.x.ai/v1",
-     "rh_id": "ff3cde7e-0f65-43d7-8fb2-6475c99f5990", "rh_name": "xAI"},
-    {"kelivo_key": "ByteDance", "type": "openai",
-     "url": "https://ark.cn-beijing.volces.com/api/v3",
-     "rh_id": "3dfd6f9b-f9d9-417f-80c1-ff8d77184191", "rh_name": "火山引擎"},
-]
-
-
-def _normalize_url(url: str) -> str:
-    return url.rstrip("/")
-
-
-def _find_builtin_by_kelivo(entry: dict[str, Any], key: str) -> dict[str, str] | None:
-    ptype = str(entry.get("providerType") or "").lower()
-    base = _normalize_url(str(entry.get("baseUrl") or ""))
-    for b in BUILTIN_PROVIDERS:
-        if _normalize_url(b["url"]) != base:
-            continue
-        btype = b["type"]
-        if ptype in ("openai", "google", "claude") and ptype != btype:
-            continue
-        if not ptype and key == b["kelivo_key"]:
-            return b
-        if ptype == btype or (ptype == "" and key == b["kelivo_key"]):
-            return b
-    return None
-
-
-def _find_builtin_by_rh_id(rh_id: str) -> dict[str, str] | None:
-    for b in BUILTIN_PROVIDERS:
-        if b["rh_id"] == rh_id:
-            return b
-    return None
-
-
-def _now_iso() -> str:
-    return datetime.now().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
-
-
-def _model_uuid(provider_id: str, model_name: str) -> str:
-    return str(uuidlib.uuid5(_MODEL_NS, f"{provider_id}:{model_name}"))
-
-
-def _upper_list(values: Any) -> list[str]:
-    if not isinstance(values, list):
-        return ["TEXT"]
-    out = [str(v).upper() for v in values]
-    return out or ["TEXT"]
-
-
-def _lower_list(values: Any, default: list[str]) -> list[str]:
-    if not isinstance(values, list):
-        return default
-    out = [str(v).lower() for v in values]
-    return out or default
-
-
-def _override_map(overrides: Any) -> dict[str, Any]:
-    return overrides if isinstance(overrides, dict) else {}
-
-
-def _as_list(value: Any) -> list[Any]:
-    return value if isinstance(value, list) else []
-
-
-def _parse_json_str(value: Any) -> Any:
-    """Parse a Kelivo *_v1 JSON-stringified preference value."""
-    if isinstance(value, str):
-        try:
-            return json.loads(value)
-        except (ValueError, TypeError):
-            return None
-    return value
-
-
-def _json_str(value: Any) -> str:
-    if isinstance(value, str):
-        return value
-    return json.dumps(value, ensure_ascii=False)
+def _rikkahub_entity_ids(settings: dict[str, Any]) -> dict[str, dict[str, str]]:
+    maps = {"mcp": {}, "instruction": {}, "worldBook": {}, "quickPhrase": {},
+            "search": {}, "tts": {}, "asr": {}}
+    for key, kind in (("mcpServers", "mcp"), ("modeInjections", "instruction"),
+                      ("lorebooks", "worldBook"), ("quickMessages", "quickPhrase"),
+                      ("searchServices", "search"), ("ttsProviders", "tts"),
+                      ("asrProviders", "asr")):
+        for entry in _as_list(settings.get(key)):
+            if isinstance(entry, dict) and entry.get("id"):
+                maps[kind][str(entry["id"])] = str(entry["id"])
+    return maps
 
 
 # ---------------------------------------------------------------------------
-# Kelivo -> RikkaHub entry converters
+# Kelivo source -> Kelivo target
 # ---------------------------------------------------------------------------
 
-def _convert_provider_to_rh(entry: dict[str, Any], key: str) -> dict[str, Any]:
-    provider_type = str(entry.get("providerType") or "openai").lower()
-    if provider_type in ("google", "gemini"):
-        provider_type = "google"
-    elif provider_type in ("claude", "anthropic"):
-        provider_type = "claude"
+def _kelivo_to_kelivo(source: Backup, target: TargetProfile) -> SettingsResult:
+    payload = source.payload
+    assert isinstance(payload, KelivoPayload)
+    settings = json.loads(json.dumps(payload.settings))
+    providers = _as_dict(_parse(settings.get("provider_configs_v1")))
+    assistants = _as_list(_parse(settings.get("assistants_v1")))
+    diagnostics: list[Diagnostic] = []
+    provider_ids = {str(key): str(key) for key in providers}
+    models_by_rh_uuid: dict[str, tuple[str, str]] = {}
+    model_ids: dict[tuple[str, str], str] = {}
+    for key, value in providers.items():
+        if not isinstance(value, dict):
+            continue
+        for logical in _as_list(value.get("models")):
+            if isinstance(logical, str) and logical:
+                model_ids[(str(key), logical)] = _model_uuid(str(key), logical)
+    assistant_ids = {
+        str(a["id"]): str(a["id"]) for a in assistants
+        if isinstance(a, dict) and a.get("id")}
+    entity_ids = _kelivo_entity_ids(settings)
+    flags = _flags_from_kelivo_assistants(assistants)
+    entries = _memory_entries_from_kelivo(settings, source)
+    workspaces = _as_list(_parse(settings.get("workspaces_v1")))
+    workspace_ids = {
+        str(w.get("id")): str(w.get("id")) for w in workspaces
+        if isinstance(w, dict) and w.get("id")}
+    skills = _as_list(_parse(settings.get("skills_v1")))
+    skill_ids = {str(s.get("id")): str(s.get("id")) for s in skills
+                 if isinstance(s, dict) and s.get("id")}
+    return SettingsResult(
+        settings=settings,
+        provider_ids=provider_ids,
+        model_ids=model_ids,
+        assistant_ids=assistant_ids,
+        workspace_ids=workspace_ids,
+        skill_ids=skill_ids,
+        models_by_rh_uuid=models_by_rh_uuid,
+        entity_ids=entity_ids,
+        memory_entries=entries,
+        assistant_permissions={
+            str(a["id"]): {"allow_system_prompt": True}
+            for a in assistants if isinstance(a, dict) and a.get("id")},
+        diagnostics=tuple(diagnostics),
+    )
+
+
+def _kelivo_entity_ids(settings: dict[str, Any]) -> dict[str, dict[str, str]]:
+    maps: dict[str, dict[str, str]] = {
+        "mcp": {}, "instruction": {}, "worldBook": {}, "quickPhrase": {},
+        "search": {}, "tts": {}, "asr": {},
+    }
+    for source_key, kind in (("mcp_servers_v1", "mcp"),
+                             ("instruction_injections_v1", "instruction"),
+                             ("world_books_v1", "worldBook"),
+                             ("quick_phrases_v1", "quickPhrase"),
+                             ("search_services_v1", "search"),
+                             ("tts_services_v1", "tts"),
+                             ("asr_services_v1", "asr")):
+        for entry in _as_list(_parse(settings.get(source_key))):
+            if isinstance(entry, dict) and entry.get("id"):
+                maps[kind][str(entry["id"])] = str(entry["id"])
+    return maps
+
+
+def _flags_from_kelivo_assistants(
+    assistants: list[Any]) -> dict[str, AssistantMemoryFlags]:
+    flags: dict[str, AssistantMemoryFlags] = {}
+    for assistant in assistants:
+        if not isinstance(assistant, dict) or not assistant.get("id"):
+            continue
+        flags[str(assistant["id"])] = AssistantMemoryFlags(
+            use_global=False,
+            enable=bool(assistant.get("enableMemory", True)),
+        )
+    return flags
+
+
+def _memory_entries_from_kelivo(settings: dict[str, Any],
+                                source: Backup) -> list[MemoryEntry]:
+    entries: list[MemoryEntry] = []
+    raw = _as_list(_parse(settings.get("memory_entries_v1")))
+    for index, payload in enumerate(raw):
+        if not isinstance(payload, dict):
+            continue
+        content = payload.get("content")
+        if not isinstance(content, str):
+            continue
+        entries.append(MemoryEntry(
+            id=str(payload.get("id") or f"memory-{index}"),
+            scope=str(payload.get("scope") or "assistant"),
+            assistant_id=payload.get("assistantId")
+            if isinstance(payload.get("assistantId"), str) else None,
+            type=str(payload.get("type") or "instruction"),
+            status=str(payload.get("status") or "active"),
+            content=content,
+            source=str(payload.get("source") or "manual"),
+            created_us=int(payload.get("createdAt") or 0)
+            if isinstance(payload.get("createdAt"), int) else 0,
+            updated_us=int(payload.get("updatedAt") or 0)
+            if isinstance(payload.get("updatedAt"), int) else 0,
+            related_ids=[str(item) for item in payload.get("relatedIds") or []
+                         if isinstance(item, str)],
+            native={"payload": dict(payload)},
+        ))
+    return entries
+
+
+# ---------------------------------------------------------------------------
+# RikkaHub source -> Kelivo target
+# ---------------------------------------------------------------------------
+
+def _rikkahub_to_kelivo(source: Backup,
+                        target: TargetProfile) -> SettingsResult:
+    payload = source.payload
+    assert isinstance(payload, RikkaPayload)
+    settings = payload.settings
+    diagnostics: list[Diagnostic] = []
+    provider_payloads: dict[str, Any] = {}
+    provider_order: list[str] = []
+    model_ids: dict[tuple[str, str], str] = {}
+    models_by_rh_uuid: dict[str, tuple[str, str]] = {}
+    provider_ids: dict[str, str] = {}
+    for provider in _as_list(settings.get("providers")):
+        if not isinstance(provider, dict) or not provider.get("id"):
+            continue
+        converter = _provider_r2k(provider, diagnostics)
+        if converter is None:
+            continue
+        key, payload_entry, model_map = converter
+        provider_ids[str(provider["id"])] = key
+        provider_payloads[key] = payload_entry
+        provider_order.append(key)
+        for rh_uuid, logical in model_map:
+            model_ids[(str(provider["id"]), logical)] = rh_uuid
+            models_by_rh_uuid[rh_uuid] = (key, logical)
+    workspaces_out, workspace_ids = _workspaces_r2k(source, diagnostics)
+    assistants_out: list[dict[str, Any]] = []
+    assistant_ids: dict[str, str] = {}
+    assistant_permissions: dict[str, dict[str, bool]] = {}
+    for assistant in _as_list(settings.get("assistants")):
+        if not isinstance(assistant, dict) or not assistant.get("id"):
+            continue
+        mapped = _assistant_r2k(assistant, models_by_rh_uuid, diagnostics,
+                                workspace_ids=workspace_ids)
+        assistants_out.append(mapped)
+        assistant_ids[str(assistant["id"])] = str(mapped["id"])
+        assistant_permissions[str(assistant["id"])] = {
+            "allow_system_prompt": bool(
+                assistant.get("allowConversationSystemPrompt")),
+        }
+    mcp_out, mcp_ids = _mcp_r2k(settings.get("mcpServers"), diagnostics)
+    instructions_out, instruction_ids = _instructions_r2k(
+        settings.get("modeInjections"), diagnostics)
+    quick_out, quick_ids = _quick_phrases_r2k(settings.get("quickMessages"))
+    tags_out, tag_ids = _tags_r2k(settings.get("assistantTags"))
+    entities = {
+        "mcp": mcp_ids,
+        "instruction": instruction_ids,
+        "worldBook": {},
+        "quickPhrase": quick_ids,
+        "search": {},
+        "tts": {},
+        "asr": {},
+    }
+    skills = [skill.id for skill in _source_skills(source)]
+    skill_ids = {name: name for name in skills}
+    output: dict[str, Any] = {
+        "provider_configs_v1": _json(provider_payloads),
+        "providers_order_v1": provider_order,
+        "assistants_v1": _json(assistants_out),
+        "mcp_servers_v1": _json(mcp_out),
+        "instruction_injections_v1": _json(instructions_out),
+        "quick_phrases_v1": _json(quick_out),
+        "assistant_tags_v1": _json(tags_out),
+        "world_books_v1": _json([]),
+        "search_services_v1": _json([]),
+        "tts_services_v1": _json([]),
+        "memory_entries_v1": _json([]),
+        "workspaces_v1": _json(workspaces_out),
+        "skills_v1": _json([]),
+        "user_profile_fields_v1": _json([]),
+    }
+    if settings.get("worldBooks") or settings.get("lorebooks"):
+        diagnostics.append(_diag(
+            "unsupported_data", "world book", 1,
+            "RikkaHub 世界书与 Kelivo 条目结构不等价，未迁移条目"))
+    search_services = _as_list(settings.get("searchServices"))
+    if search_services:
+        diagnostics.append(_diag(
+            "unsupported_data", "search service", len(search_services),
+            "搜索服务协议不同，未迁移"))
+    tts_services = _as_list(settings.get("ttsProviders")) + _as_list(
+        settings.get("asrProviders"))
+    if tts_services:
+        diagnostics.append(_diag(
+            "unsupported_data", "speech service", len(tts_services),
+            "语音服务协议不同，未迁移"))
+    _copy_feature_settings_r2k(settings, output, models_by_rh_uuid,
+                               entity_ids=None, diagnostics=diagnostics)
+    memory_entries, memory_diagnostics = _memory_r2k(
+        source, assistants_out, model.SettingsResult(
+            settings=output, assistant_ids=assistant_ids),
+        source_flags=_assistant_flags_from_rh_settings(settings))
+    output["memory_entries_v1"] = _json([
+        _memory_entry_payload(entry) for entry in memory_entries])
+    diagnostics.extend(memory_diagnostics)
+    return SettingsResult(
+        settings=output,
+        provider_ids=provider_ids,
+        model_ids=model_ids,
+        assistant_ids=assistant_ids,
+        workspace_ids=workspace_ids,
+        skill_ids=skill_ids,
+        models_by_rh_uuid=models_by_rh_uuid,
+        entity_ids=entities,
+        memory_entries=memory_entries,
+        assistant_permissions=assistant_permissions,
+        diagnostics=tuple(diagnostics),
+    )
+
+
+def _provider_r2k(provider: dict[str, Any],
+                  diagnostics: list[Diagnostic]
+                  ) -> tuple[str, dict[str, Any], list[tuple[str, str]]] | None:
+    rh_id = str(provider["id"])
+    key = _entity_uuid(rh_id, "provider")
+    kind = str(provider.get("type") or "openai")
+    base: dict[str, Any] = {
+        "id": key,
+        "enabled": bool(provider.get("enabled", True)),
+        "name": str(provider.get("name") or ""),
+        "apiKey": str(provider.get("apiKey") or ""),
+        "baseUrl": str(provider.get("baseUrl") or ""),
+        "models": [],
+        "modelOverrides": {},
+        "customHeaders": _headers_r2k(provider.get("customHeaders")),
+        "customBody": _bodies_r2k(provider.get("customBodies")),
+    }
+    models = _as_list(provider.get("models"))
+    model_map: list[tuple[str, str]] = []
+    kept_models = []
+    for entry in models:
+        if not isinstance(entry, dict):
+            continue
+        if isinstance(entry.get("providerOverwrite"), dict):
+            diagnostics.append(_diag(
+                "unsupported_data", "model override", 1,
+                "模型的 providerOverwrite 在 Kelivo 中无等价结构，已丢弃该模型"))
+            continue
+        logical = str(entry.get("modelId") or "")
+        rh_uuid = str(entry.get("id") or _model_uuid(key, logical))
+        if not logical:
+            continue
+        kept_models.append(logical)
+        base["models"].append(logical)
+        base["modelOverrides"][logical] = _model_override_r2k(entry)
+        model_map.append((rh_uuid, logical))
+    if not model_map:
+        diagnostics.append(_diag(
+            "unsupported_data", "provider", 1,
+            "提供商没有可表达的模型，已丢弃"))
+        return None
+    if kind in ("chatgpt", "grok"):
+        base["apiKey"] = ""
+        base["providerType"] = "openai"
+        base["oauthProvider"] = kind
+        base["baseUrl"] = ("https://chatgpt.com/backend-api/codex"
+                           if kind == "chatgpt" else "https://api.x.ai/v1")
+        base["useResponseApi"] = True
+        credential = provider.get("credential")
+        if isinstance(credential, dict):
+            oauth = _credential_r2k(credential, diagnostics)
+            if oauth is not None:
+                base["oauthCredentials"] = oauth
+        return key, base, model_map
+    if kind == "google":
+        base["providerType"] = "google"
+        base["vertexAI"] = bool(provider.get("vertexAI"))
+        if provider.get("useServiceAccount"):
+            base["serviceAccountJson"] = _json({
+                "type": "service_account",
+                "private_key": provider.get("privateKey") or "",
+                "client_email": provider.get("serviceAccountEmail") or "",
+                "project_id": provider.get("projectId") or "",
+                "location": provider.get("location") or "",
+                "private_key_id": provider.get("privateKeyId") or "",
+            })
+        base["location"] = provider.get("location") or None
+        base["projectId"] = provider.get("projectId") or None
+    elif kind == "claude":
+        base["providerType"] = "claude"
+        base["chatPath"] = None
+        base["useResponseApi"] = False
+        base["claudePromptCachingEnabled"] = bool(provider.get("promptCaching"))
+        ttl = str(provider.get("promptCacheTtl") or "5m")
+        base["claudePromptCachingTtl"] = "1h" if ttl in ("1h", "ONE_HOUR") else "5m"
     else:
-        provider_type = "openai"
+        base["providerType"] = "openai"
+        base["chatPath"] = str(provider.get("chatCompletionsPath") or
+                               "/chat/completions")
+        base["useResponseApi"] = bool(provider.get("useResponseApi"))
+    quota = provider.get("quotaQuery")
+    if isinstance(quota, dict) and quota.get("enabled"):
+        url = str(quota.get("url") or "")
+        api_path = url[len("{{baseUrl}}"):] if url.startswith("{{baseUrl}}") \
+            else url
+        base["balanceEnabled"] = True
+        base["balanceApiPath"] = api_path
+        base["balanceResultPath"] = str(
+            quota.get("resultPath") or "data.total_usage")
+    return key, base, model_map
 
-    builtin = _find_builtin_by_kelivo(entry, key)
-    provider_id = (builtin["rh_id"] if builtin
-                   else _entity_uuid(entry.get("id") or key, "provider"))
 
-    out: dict[str, Any] = dict(RH_PROVIDER_DEFAULTS)
-    out["type"] = provider_type
-    out["id"] = provider_id
-    out["enabled"] = bool(entry.get("enabled", True))
-    out["name"] = str(entry.get("name") or (builtin["rh_name"] if builtin else ""))
-    if entry.get("apiKey") is not None:
-        out["apiKey"] = str(entry["apiKey"])
-    if entry.get("baseUrl") is not None:
-        out["baseUrl"] = str(entry["baseUrl"])
-    if entry.get("chatPath") is not None:
-        out["chatCompletionsPath"] = str(entry["chatPath"])
-    if entry.get("useResponseApi") is not None:
-        out["useResponseApi"] = bool(entry["useResponseApi"])
+def _model_override_r2k(entry: dict[str, Any]) -> dict[str, Any]:
+    kind = str(entry.get("type") or "CHAT").lower()
+    return {
+        "apiModelId": entry.get("modelId"),
+        "name": entry.get("displayName") or entry.get("modelId"),
+        "type": "embedding" if kind == "embedding" else (
+            "image" if kind == "image" else "chat"),
+        "input": [str(item).lower() for item in
+                  _as_list(entry.get("inputModalities"))] or ["text"],
+        "output": [str(item).lower() for item in
+                   _as_list(entry.get("outputModalities"))] or ["text"],
+        "abilities": [str(item).lower() for item in
+                      _as_list(entry.get("abilities"))],
+    }
 
-    overrides = _override_map(entry.get("modelOverrides"))
-    models: list[dict[str, Any]] = []
-    for name in _as_list(entry.get("models")):
-        name = str(name)
-        ov = overrides.get(name) if isinstance(overrides, dict) else None
-        ov = ov if isinstance(ov, dict) else {}
-        model = dict(RH_MODEL_DEFAULTS)
-        model["modelId"] = name
-        model["displayName"] = str(ov.get("name") or name)
-        model["id"] = _model_uuid(provider_id, name)
-        mtype = str(ov.get("type") or "chat").upper()
-        if mtype not in ("CHAT", "IMAGE", "EMBEDDING"):
-            mtype = "CHAT"
-        model["type"] = mtype
-        model["inputModalities"] = _upper_list(ov.get("input"))
-        model["outputModalities"] = _upper_list(ov.get("output"))
-        abilities = _as_list(ov.get("abilities"))
-        model["abilities"] = [str(a).upper() for a in abilities]
-        models.append(model)
-    out["models"] = models
+
+def _credential_r2k(credential: dict[str, Any],
+                    diagnostics: list[Diagnostic]) -> dict[str, Any] | None:
+    access = credential.get("accessToken")
+    refresh = credential.get("refreshToken")
+    expires = credential.get("expiresAt")
+    if not isinstance(access, str) or not access \
+            or not isinstance(refresh, str) or not refresh \
+            or not isinstance(expires, int) or expires <= 0:
+        diagnostics.append(_diag(
+            "unsupported_data", "oauth credential", 1,
+            "凭据缺少可用的 refresh token 或过期时间，目标保持未登录"))
+        return None
+    return {
+        "accessToken": access,
+        "refreshToken": refresh,
+        "expiresAt": datetime.fromtimestamp(
+            expires / 1000, tz=timezone.utc).isoformat(),
+        "sessionId": str(uuidlib.uuid4()),
+        "accountId": credential.get("accountId")
+        if isinstance(credential.get("accountId"), str) else None,
+        "email": credential.get("email")
+        if isinstance(credential.get("email"), str) else None,
+        "plan": credential.get("plan")
+        if isinstance(credential.get("plan"), str) else None,
+        "requiresLogin": False,
+    }
+
+
+def _headers_r2k(value: Any) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    for entry in _as_list(value):
+        if isinstance(entry, dict):
+            name = entry.get("name") or entry.get("key")
+            header_value = entry.get("value")
+            if isinstance(name, str) and name and isinstance(header_value, str):
+                out.append({"name": name, "value": header_value})
     return out
 
 
-def _convert_assistant_to_rh(
-    entry: dict[str, Any],
-    *,
-    model_by_key: dict[tuple[str, str], str] | None = None,
-    model_by_name: dict[str, str] | None = None,
-) -> tuple[dict[str, Any], str | None]:
-    """Map a Kelivo assistant onto the RikkaHub shape.
+def _bodies_r2k(value: Any) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    for entry in _as_list(value):
+        if isinstance(entry, dict):
+            key = entry.get("key") or entry.get("name")
+            body_value = entry.get("value")
+            if isinstance(key, str) and key and isinstance(body_value, str):
+                out.append({"key": key, "value": body_value})
+    return out
 
-    Returns (assistant, note).  ``note`` is a loss warning when the
-    assistant's chatModelId could not be resolved to a RikkaHub model uuid:
-    RikkaHub deserializes chatModelId as a kotlin.uuid.Uuid, so a raw Kelivo
-    model-name string would fail the whole settings restore.
-    """
-    out: dict[str, Any] = dict(RH_ASSISTANT_DEFAULTS)
-    note: str | None = None
-    out["id"] = _entity_uuid(entry.get("id"), "assistant")
-    out["name"] = str(entry.get("name") or "")
-    avatar = entry.get("avatar")
-    if isinstance(avatar, dict) and avatar.get("type"):
-        out["avatar"] = avatar
-    elif isinstance(avatar, str) and avatar:
-        # Kelivo stores avatars as plain path/url/base64 strings.
-        out["avatar"] = {"type": "me.rerere.rikkahub.data.model.Avatar.Image",
-                          "url": avatar}
-    else:
-        out["avatar"] = RH_AVATAR_DUMMY
-    if entry.get("useAssistantAvatar") is not None:
-        out["useAssistantAvatar"] = bool(entry["useAssistantAvatar"])
-    if entry.get("chatModelId") is not None:
-        model_uuid = None
-        name = str(entry["chatModelId"])
-        provider_key = entry.get("chatModelProvider")
-        if model_by_key is not None and provider_key:
-            model_uuid = model_by_key.get((str(provider_key), name))
-        if model_uuid is None and not provider_key \
-                and model_by_name is not None:
-            # Unqualified model name: safe only when it is unique across
-            # all providers.
-            model_uuid = model_by_name.get(name)
-        if model_uuid:
-            out["chatModelId"] = model_uuid
+
+def _assistant_r2k(assistant: dict[str, Any],
+                   models_by_rh_uuid: dict[str, tuple[str, str]],
+                   diagnostics: list[Diagnostic],
+                   *, workspace_ids: dict[str, str] | None = None) -> dict[str, Any]:
+    model_id = assistant.get("chatModelId")
+    provider_key = None
+    logical_id = None
+    if isinstance(model_id, str):
+        mapped = models_by_rh_uuid.get(model_id)
+        if mapped:
+            provider_key, logical_id = mapped
         else:
-            # Never emit a non-UUID identifier: RikkaHub's restore would
-            # fail decoding settings.json.  Fall back to the global default
-            # model and warn about the loss.
-            out["chatModelId"] = None
-            note = (f"助手「{out['name'] or entry.get('id') or '?'}」的模型"
-                    f"「{name}」无法解析为 RikkaHub 模型 UUID，"
-                    f"已回退为全局默认模型")
-    for field in ("temperature", "topP", "maxTokens", "background"):
-        if entry.get(field) is not None:
-            out[field] = entry[field]
-    if entry.get("streamOutput") is not None:
-        out["streamOutput"] = bool(entry["streamOutput"])
-    for field in ("systemPrompt", "messageTemplate"):
-        if entry.get(field) is not None:
-            value = str(entry[field])
-            if field == "systemPrompt":
-                value = convert_prompt_vars(value, to_rikkahub=True)
-            out[field] = value
-    if entry.get("enableMemory") is not None:
-        out["enableMemory"] = bool(entry["enableMemory"])
-    if entry.get("enableRecentChatsReference") is not None:
-        out["enableRecentChatsReference"] = bool(entry["enableRecentChatsReference"])
-    if entry.get("customHeaders") is not None:
-        out["customHeaders"] = _as_list(entry["customHeaders"])
-    if entry.get("customBody") is not None:
-        out["customBodies"] = _as_list(entry["customBody"])
-    # Kelivo skillIds (skill names) -> RikkaHub enabledSkills.
-    if entry.get("skillIds"):
-        out["enabledSkills"] = [str(s) for s in _as_list(entry["skillIds"])]
-    presets = _parse_json_str(entry.get("presetMessages"))
-    if isinstance(presets, list):
-        out["presetMessages"] = [
-            {
-                "id": str(p.get("id") or uuidlib.uuid4()),
-                "role": str(p.get("role") or "user"),
-                "parts": [{"type": "text",
-                           "text": str(p.get("content") or ""),
-                           "metadata": None}],
-                "annotations": [],
-                "createdAt": _now_iso(),
-                "finishedAt": None,
-                "modelId": None,
-                "usage": None,
-                "translation": None,
-            }
-            for p in presets if isinstance(p, dict)
-        ]
-    return out, note
-
-
-def _convert_mcp_to_rh(entry: dict[str, Any]) -> dict[str, Any] | None:
-    """Kelivo MCP server -> RikkaHub.  Returns None for Kelivo built-ins."""
-    server_id = str(entry.get("id") or "")
-    server_name = str(entry.get("name") or "")
-    if server_id in KL_BUILTIN_MCP_IDS or server_name in KL_BUILTIN_MCP_NAMES:
-        return None  # RikkaHub has no equivalent built-in
-    # RikkaHub supports only sse | streamable_http; map the Kelivo enum onto
-    # the closest equivalent.
-    transport = str(entry.get("transport") or "streamable_http")
-    if transport in ("inmemory", "http", "stdio"):
-        transport = "streamable_http"
-    tools = []
-    for t in _as_list(entry.get("tools")):
-        if not isinstance(t, dict):
+            diagnostics.append(_diag(
+                "identity_reference_unresolved", "assistant model", 1,
+                "助手的模型引用无法映射，已清空该助手的模型"))
+    avatar = assistant.get("avatar")
+    avatar_value = None
+    if isinstance(avatar, dict) and isinstance(avatar.get("url"), str):
+        avatar_value = avatar["url"]
+    presets = []
+    dropped_parts = 0
+    for preset in _as_list(assistant.get("presetMessages")):
+        if not isinstance(preset, dict):
             continue
-        tools.append({
-            "enable": bool(t.get("enabled", True)),
-            "name": str(t.get("name") or ""),
-            "description": t.get("description"),
-            "inputSchema": _params_to_schema(
-                t.get("schema"), _as_list(t.get("params"))),
-            "needsApproval": bool(t.get("needsApproval", False)),
+        texts = []
+        for part in _as_list(preset.get("parts")):
+            if isinstance(part, dict) and part.get("type") == "text":
+                texts.append(str(part.get("text") or ""))
+            else:
+                dropped_parts += 1
+        role = preset.get("role") if preset.get("role") in (
+            "user", "assistant") else "user"
+        presets.append({
+            "id": _entity_uuid(preset.get("id") or _entity_uuid(
+                f"{assistant.get('id')}:preset", "preset"), "preset"),
+            "role": role,
+            "content": "\n\n".join(texts),
         })
-    headers = entry.get("headers")
-    rh_headers = []
-    if isinstance(headers, dict):
-        # RikkaHub serializes Pair<String,String> as {"first","second"}.
-        rh_headers = [{"first": str(k), "second": str(v)}
-                      for k, v in headers.items()]
+    if dropped_parts:
+        diagnostics.append(_diag(
+            "unsupported_data", "preset part", dropped_parts,
+            "预设消息中的非文本部件未迁移"))
+    if _as_list(assistant.get("regexes")):
+        diagnostics.append(_diag(
+            "unsupported_data", "assistant regex",
+            len(_as_list(assistant.get("regexes"))),
+            "RikkaHub 助手正则规则在 Kelivo 中没有等价结构"))
+    local_tools = [str(item) for item in _as_list(assistant.get("localTools"))
+                   if isinstance(item, str)]
+    mcp_servers = [str(item) for item in _as_list(assistant.get("mcpServers"))
+                   if isinstance(item, str)]
+    context_limit = int(assistant.get("contextMessageLimit") or 0)
     return {
-        "type": transport,
-        "id": _entity_uuid(entry.get("id"), "mcp"),
-        "url": str(entry.get("url") or ""),
-        "commonOptions": {
-            "enable": bool(entry.get("enabled", True)),
-            "name": str(entry.get("name") or ""),
-            "headers": rh_headers,
-            "tools": tools,
-            "oauth": None,
-        },
+        "id": str(assistant["id"]),
+        "name": str(assistant.get("name") or ""),
+        "avatar": avatar_value,
+        "useAssistantAvatar": bool(assistant.get("useAssistantAvatar")),
+        "useAssistantName": True,
+        "chatModelProvider": provider_key,
+        "chatModelId": logical_id,
+        "temperature": assistant.get("temperature"),
+        "topP": assistant.get("topP"),
+        "contextMessageSize": context_limit if context_limit > 0 else 64,
+        "limitContextMessages": context_limit > 0,
+        "streamOutput": bool(assistant.get("streamOutput", True)),
+        "maxTokens": assistant.get("maxTokens"),
+        "systemPrompt": convert_prompt_vars(
+            str(assistant.get("systemPrompt") or ""), to_rikkahub=False),
+        "allowConversationSystemPrompt": bool(
+            assistant.get("allowConversationSystemPrompt")),
+        "allowConversationPromptInjection": False,
+        "messageTemplate": str(assistant.get("messageTemplate") or
+                               "{{ message }}"),
+        "searchEnabled": bool(assistant.get("enableWebSearch")),
+        "mcpServerIds": mcp_servers,
+        "defaultWorkspaceId": (workspace_ids or {}).get(
+            str(assistant.get("workspaceId") or "")) or None,
+        "localToolIds": local_tools,
+        "skillIds": [str(item) for item in
+                     _as_list(assistant.get("enabledSkills"))],
+        "background": assistant.get("background")
+        if isinstance(assistant.get("background"), str) else None,
+        "useGradientBackground": bool(assistant.get("useGradientBackground")),
+        "customHeaders": _headers_r2k(assistant.get("customHeaders")),
+        "customBody": _bodies_r2k(assistant.get("customBodies")),
+        "enableMemory": bool(assistant.get("enableMemory")),
+        "enableRecentChatsReference": bool(
+            assistant.get("enableRecentChatsReference")),
+        "presetMessages": presets,
+        "regexRules": [],
+        "enableTimeInjection": bool(assistant.get("enableTimeReminder")),
     }
 
 
-def _params_to_schema(schema: Any, params: list[Any]) -> dict[str, Any] | None:
-    """Kelivo params/schema -> RikkaHub inputSchema (JSON Schema object)."""
-    if isinstance(schema, dict) and schema.get("type") == "object":
-        return schema
-    properties: dict[str, Any] = {}
-    required: list[str] = []
-    for p in params:
-        if not isinstance(p, dict) or not p.get("name"):
-            continue
-        name = str(p["name"])
-        prop: dict[str, Any] = {}
-        if p.get("type"):
-            prop["type"] = str(p["type"])
-        if p.get("description"):
-            prop["description"] = str(p["description"])
-        if p.get("default") is not None:
-            prop["default"] = p["default"]
-        properties[name] = prop
-        if p.get("required"):
-            required.append(name)
-    if not properties:
-        return None
-    out: dict[str, Any] = {"type": "object", "properties": properties}
-    if required:
-        out["required"] = required
-    return out
-
-
-def _schema_to_params(schema: Any) -> list[dict[str, Any]]:
-    """RikkaHub inputSchema -> Kelivo McpParamSpec list."""
-    if not isinstance(schema, dict):
-        return []
-    properties = schema.get("properties")
-    if not isinstance(properties, dict):
-        return []
-    required = schema.get("required")
-    required_set = set(required) if isinstance(required, list) else set()
-    params: list[dict[str, Any]] = []
-    for name, prop in properties.items():
-        if not isinstance(prop, dict):
-            continue
-        param: dict[str, Any] = {"name": str(name),
-                                 "required": str(name) in required_set}
-        if prop.get("type"):
-            param["type"] = str(prop["type"])
-        if prop.get("description"):
-            param["description"] = str(prop["description"])
-        if prop.get("default") is not None:
-            param["default"] = prop["default"]
-        params.append(param)
-    return params
-
-
-def _convert_tts_to_rh(entry: dict[str, Any]) -> dict[str, Any]:
-    kind = str(entry.get("kind") or entry.get("type") or "openai")
-    out: dict[str, Any] = {"type": kind,
-                           "id": _entity_uuid(entry.get("id"), "tts"),
-                           "name": str(entry.get("name") or "")}
-    for field in ("apiKey", "baseUrl"):
-        if entry.get(field) is not None:
-            out[field] = str(entry[field])
-    if entry.get("voiceId") is not None:
-        out["voiceId"] = str(entry["voiceId"])
-    if entry.get("voice") is not None:
-        out["voice"] = str(entry["voice"])
-    if entry.get("language") is not None:
-        out["language"] = str(entry["language"])
-    return out
-
-
-def _convert_quick_phrase_to_rh(entry: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "id": _entity_uuid(entry.get("id"), "quick_phrase"),
-        "title": str(entry.get("title") or ""),
-        "content": str(entry.get("content") or ""),
-    }
-
-
-def _convert_injection_to_rh(entry: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "type": "mode",
-        "id": _entity_uuid(entry.get("id"), "injection"),
-        "name": str(entry.get("title") or entry.get("name") or ""),
-        "enabled": True,
-        "priority": 0,
-        "position": "after_system_prompt",
-        "content": convert_prompt_vars(
-            str(entry.get("prompt") or entry.get("content") or ""),
-            to_rikkahub=True),
-        "injectDepth": 4,
-        "role": "user",
-    }
-
-
-def _convert_world_book_to_rh(entry: dict[str, Any]) -> dict[str, Any]:
-    """Kelivo world book -> RikkaHub lorebook (RegexInjection entries)."""
-    entries: list[dict[str, Any]] = []
-    for e in _as_list(entry.get("entries")):
-        if not isinstance(e, dict):
-            continue
-        position = str(e.get("position") or "AFTER_SYSTEM_PROMPT").lower()
-        entries.append({
-            "type": "regex",
-            "id": _entity_uuid(e.get("id"), "lorebook_entry"),
-            "name": str(e.get("name") or ""),
-            "enabled": bool(e.get("enabled", True)),
-            "priority": int(e.get("priority") or 0),
-            "position": position,
-            "content": convert_prompt_vars(
-                str(e.get("content") or ""), to_rikkahub=True),
-            "injectDepth": int(e.get("injectDepth") or 4),
-            "role": str(e.get("role") or "USER").lower(),
-            "keywords": _as_list(e.get("keywords")),
-            "useRegex": bool(e.get("useRegex", False)),
-            "caseSensitive": bool(e.get("caseSensitive", False)),
-            "scanDepth": int(e.get("scanDepth") or 4),
-            "constantActive": bool(e.get("constantActive", False)),
-        })
-    return {
-        "id": _entity_uuid(entry.get("id"), "lorebook"),
-        "name": str(entry.get("name") or ""),
-        "description": str(entry.get("description") or ""),
-        "enabled": bool(entry.get("enabled", True)),
-        "entries": entries,
-    }
-
-
-# Search service types present in both apps (same JSON shape); the rest are
-# app-specific and dropped with a warning.
-_SHARED_SEARCH_TYPES = {
-    "bing_local", "zhipu", "tavily", "exa", "searxng", "linkup",
-    "brave", "metaso", "ollama", "perplexity", "jina", "bocha",
-    "grok", "serper",
-}
-
-
-def _convert_search_to_rh(entry: dict[str, Any]) -> dict[str, Any] | None:
-    stype = str(entry.get("type") or "")
-    if stype not in _SHARED_SEARCH_TYPES:
-        return None
-    out: dict[str, Any] = {"type": stype,
-                           "id": _entity_uuid(entry.get("id"), "search")}
-    for field in ("apiKey", "url", "engines", "language", "username",
-                  "password", "depth", "maxTokens", "maxTokensPerPage",
-                  "summary", "model", "customUrl", "systemPrompt",
-                  "searchUrl", "scrapeUrl"):
-        if entry.get(field) is not None:
-            out[field] = entry[field]
-    return out
-
-
-def _convert_search_to_kl(entry: dict[str, Any]) -> dict[str, Any] | None:
-    stype = str(entry.get("type") or "")
-    if stype not in _SHARED_SEARCH_TYPES:
-        return None
-    out: dict[str, Any] = {"type": stype,
-                           "id": _entity_uuid(entry.get("id"), "search"),
-                           "apiKeys": [],
-                           "keyManagement": None}
-    api_key = entry.get("apiKey")
-    if isinstance(api_key, str) and api_key:
-        now = int(datetime.now().timestamp() * 1000)
-        out["apiKeys"] = [{
-            "id": _entity_uuid(entry.get("id"), "search_key"),
-            "key": api_key,
-            "isEnabled": True,
-            "priority": 5,
-            "usage": {"totalRequests": 0, "successfulRequests": 0,
-                       "failedRequests": 0, "consecutiveFailures": 0,
-                       "lastUsed": None},
-            "status": "active",
-            "createdAt": now,
-            "updatedAt": now,
-        }]
-    for field in ("url", "engines", "language", "username",
-                  "password", "depth", "maxTokens", "maxTokensPerPage",
-                  "summary", "model", "customUrl", "systemPrompt",
-                  "searchUrl", "scrapeUrl"):
-        if entry.get(field) is not None:
-            out[field] = entry[field]
-    return out
-
-
-def _model_by_key_from_providers(
-    providers: list[Any],
-) -> dict[tuple[str, str], str]:
-    """(provider id, model name) -> model uuid from a plain providers list.
-
-    Handles both RikkaHub-shaped entries (models as dicts with modelId/id)
-    and bare Kelivo-style entries (models as name strings).
-    """
-    out: dict[tuple[str, str], str] = {}
-    for entry in providers:
+def _mcp_r2k(value: Any, diagnostics: list[Diagnostic]
+             ) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    out: list[dict[str, Any]] = []
+    mapping: dict[str, str] = {}
+    for entry in _as_list(value):
         if not isinstance(entry, dict) or not entry.get("id"):
             continue
-        pid = str(entry["id"])
-        for m in _as_list(entry.get("models")):
-            if isinstance(m, dict):
-                name = str(m.get("modelId") or "")
-                mid = str(m.get("id") or _model_uuid(pid, name))
-            elif isinstance(m, str) and m:
-                name = m
-                mid = _model_uuid(pid, name)
-            else:
-                continue
-            if name:
-                out[(pid, name)] = mid
-    return out
-
-
-def _unique_model_names(providers: list[Any]) -> dict[str, str]:
-    """model name -> uuid, only for names exposed by exactly one provider.
-
-    An unqualified Kelivo chatModelId (no chatModelProvider) can only be
-    resolved safely when it is unambiguous across every provider.
-    """
-    owners: dict[str, set[str]] = {}
-    uuids: dict[str, str] = {}
-    for p in providers:
-        if not isinstance(p, dict) or not p.get("id"):
+        server_id = _entity_uuid(entry["id"], "mcp")
+        transport = str(entry.get("type") or "streamable_http")
+        if transport not in ("sse", "streamable_http", "stdio"):
+            diagnostics.append(_diag(
+                "unsupported_data", "mcp server", 1,
+                f"未知的 MCP 传输类型 {transport}"))
             continue
-        pid = str(p["id"])
-        for m in _as_list(p.get("models")):
-            if not (isinstance(m, dict) and m.get("modelId")):
-                continue
-            name = str(m["modelId"])
-            owners.setdefault(name, set()).add(pid)
-            uuids.setdefault(name, str(m.get("id") or ""))
-    return {name: mid for name, mid in uuids.items()
-            if len(owners[name]) == 1 and mid}
-
-
-def build_model_maps_k2r(kelivo: dict[str, Any]) -> dict[tuple[str, str], str]:
-    """(kelivo provider key, model name) -> RikkaHub model uuid.
-
-    Mirrors the provider conversion inside build_rikkahub_settings so message
-    modelIds can be resolved to the same deterministic uuids.  Falls back to
-    the plain ``providers`` list when provider_configs_v1 is absent.
-    """
-    providers_raw = _parse_json_str(kelivo.get("provider_configs_v1"))
-    if not isinstance(providers_raw, dict):
-        return _model_by_key_from_providers(_as_list(kelivo.get("providers")))
-    out: dict[tuple[str, str], str] = {}
-    for key, v in providers_raw.items():
-        if not isinstance(v, dict):
-            continue
-        builtin = _find_builtin_by_kelivo(v, key)
-        pid = (builtin["rh_id"] if builtin
-               else _entity_uuid(v.get("id") or key, "provider"))
-        for name in _as_list(v.get("models")):
-            name = str(name)
-            out[(str(key), name)] = _model_uuid(pid, name)
-            if v.get("id"):
-                out[(str(v["id"]), name)] = _model_uuid(pid, name)
-    return out
-
-
-def build_model_maps_r2k(rikkahub: dict[str, Any]) -> dict[str, str]:
-    """RikkaHub model uuid -> Kelivo model name (the provider's modelId)."""
-    out: dict[str, str] = {}
-    for entry in _as_list(rikkahub.get("providers")):
-        if not isinstance(entry, dict):
-            continue
-        for model in _as_list(entry.get("models")):
-            if isinstance(model, dict) and model.get("id"):
-                out[str(model["id"])] = str(model.get("modelId") or "")
-    return out
-
-
-def build_rikkahub_settings(kelivo: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
-    """Convert a Kelivo settings object into a RikkaHub settings object."""
-    notes: list[str] = []
-    out: dict[str, Any] = {}
-
-    # 1. shared scalar keys
-    for key in SHARED_KEYS:
-        if key in kelivo:
-            value = kelivo[key]
-            if key in _PROMPT_KEYS and isinstance(value, str):
-                value = convert_prompt_vars(value, to_rikkahub=True)
-            out[key] = value
-
-    # 2. RikkaHub-only keys with app defaults
-    for key, value in RH_ONLY_DEFAULTS.items():
-        out.setdefault(key, value)
-    out.setdefault("themeId", "sakura")
-
-    # User profile (nickname/avatar) from Kelivo's prefs keys.
-    display = dict(out.get("displaySetting") or RH_DISPLAY_DEFAULTS)
-    if kelivo.get("user_name"):
-        display["userNickname"] = str(kelivo["user_name"])
-    avatar_type = kelivo.get("avatar_type")
-    avatar_value = kelivo.get("avatar_value")
-    if avatar_type == "emoji" and avatar_value:
-        display["userAvatar"] = {
-            "type": "me.rerere.rikkahub.data.model.Avatar.Emoji",
-            "content": str(avatar_value)}
-    elif avatar_type in ("url", "file") and avatar_value:
-        url = str(avatar_value)
-        if not (url.startswith("file://") or url.startswith("http://")
-                or url.startswith("https://")):
-            url = "file://" + url
-        display["userAvatar"] = {
-            "type": "me.rerere.rikkahub.data.model.Avatar.Image",
-            "url": url}
-    out["displaySetting"] = display
-
-    # S3 / WebDAV backup destinations.
-    webdav = _parse_json_str(kelivo.get("webdav_config_v1"))
-    if isinstance(webdav, dict):
-        out["webDavConfig"] = {
-            "url": str(webdav.get("url") or ""),
-            "username": str(webdav.get("username") or ""),
-            "password": str(webdav.get("password") or ""),
-            "path": str(webdav.get("path") or "rikkahub_backups"),
-            "items": ["DATABASE", "FILES"],
+        payload: dict[str, Any] = {
+            "id": server_id,
+            "name": str(entry.get("name") or ""),
+            "enabled": bool(entry.get("enabled", True)),
+            "transport": transport,
+            "tools": [],
         }
-    s3 = _parse_json_str(kelivo.get("s3_config_v1"))
-    if isinstance(s3, dict):
-        out["s3Config"] = {
-            "endpoint": str(s3.get("endpoint") or ""),
-            "accessKeyId": str(s3.get("accessKeyId") or ""),
-            "secretAccessKey": str(s3.get("secretAccessKey") or ""),
-            "bucket": str(s3.get("bucket") or ""),
-            "region": str(s3.get("region") or "auto"),
-            "pathStyle": bool(s3.get("pathStyle", True)),
-            "items": ["DATABASE", "FILES"],
-        }
-
-    # Search: selected index and common options back into RikkaHub.
-    selected = kelivo.get("search_selected_v1")
-    if isinstance(selected, int):
-        out["searchServiceSelected"] = selected
-    common = _parse_json_str(kelivo.get("search_common_v1"))
-    if isinstance(common, dict) and isinstance(common.get("resultSize"), int):
-        out["searchCommonOptions"] = {"resultSize": common["resultSize"]}
-
-    # 3. containers from Kelivo *_v1 JSON strings
-    providers_raw = _parse_json_str(kelivo.get("provider_configs_v1"))
-    model_by_key: dict[tuple[str, str], str] = {}
-    rh_id_by_kl_key: dict[str, str] = {}
-    if isinstance(providers_raw, dict):
-        providers = []
-        for k, v in providers_raw.items():
-            if not isinstance(v, dict):
-                continue
-            p = _convert_provider_to_rh(v, k)
-            providers.append(p)
-            pid = p["id"]
-            rh_id_by_kl_key[str(k)] = pid
-            if v.get("id"):
-                rh_id_by_kl_key[str(v["id"])] = pid
-            for name in _as_list(v.get("models")):
-                name = str(name)
-                model_by_key[(str(k), name)] = _model_uuid(pid, name)
-                if v.get("id"):
-                    model_by_key[(str(v["id"]), name)] = _model_uuid(pid, name)
-        out["providers"] = providers
-
-    elif _as_list(kelivo.get("providers")):
-        providers = _as_list(kelivo["providers"])
-        out["providers"] = providers
-        model_by_key = _model_by_key_from_providers(providers)
-
-    # Task models: Kelivo "providerKey::modelId" -> RikkaHub model uuids.
-    # Kelivo's current model (selected_model_v1) maps to RikkaHub's default
-    # chat model; the fast model follows the title model (round-trip of the
-    # R2K mapping) or the current model as Kelivo's generic fallback.
-    def _rh_model_ref(ref: Any) -> str | None:
-        if not isinstance(ref, str) or "::" not in ref:
-            return None
-        kl_key, model = ref.split("::", 1)
-        pid = rh_id_by_kl_key.get(kl_key)
-        if not pid or not model:
-            return None
-        return _model_uuid(pid, model)
-
-    for kl_key, rh_key in (("title_model_v1", "titleModelId"),
-                           ("suggestion_model_v1", "suggestionModelId"),
-                           ("translate_model_v1", "translateModeId"),
-                           ("ocr_model_v1", "ocrModelId"),
-                           ("compress_model_v1", "compressModelId")):
-        ref = _rh_model_ref(kelivo.get(kl_key))
-        if ref:
-            out[rh_key] = ref
-    title_ref = _rh_model_ref(kelivo.get("title_model_v1"))
-    current_ref = _rh_model_ref(kelivo.get("selected_model_v1"))
-    if current_ref:
-        out["chatModelId"] = current_ref
-    if title_ref:
-        out["fastModelId"] = title_ref
-    elif current_ref:
-        out["fastModelId"] = current_ref
-
-    assistants_raw = _parse_json_str(kelivo.get("assistants_v1"))
-    if isinstance(assistants_raw, list):
-        model_by_name = _unique_model_names(out.get("providers", []))
-        assistants = []
-        for e in assistants_raw:
-            if not isinstance(e, dict):
-                continue
-            a, note = _convert_assistant_to_rh(
-                e, model_by_key=model_by_key, model_by_name=model_by_name)
-            assistants.append(a)
-            if note:
-                notes.append(note)
-        out["assistants"] = assistants
-        # Switch the RikkaHub default assistant to the one Kelivo was
-        # actually used with (its current_assistant_id_v1), when present in
-        # the converted list; otherwise keep the carried-over assistantId.
-        current = kelivo.get("current_assistant_id_v1")
-        if current and any(a.get("id") == _entity_uuid(current, "assistant")
-                           for a in assistants):
-            out["assistantId"] = _entity_uuid(current, "assistant")
-        dropped_fields = sum(
-            len(set(e.keys()) - _RH_ASSISTANT_KEPT)
-            for e in assistants_raw if isinstance(e, dict))
-        if dropped_fields:
-            notes.append(f"{len(assistants)} 个助手的 {dropped_fields} 个 "
-                         "Kelivo 独有字段")
-    elif _as_list(kelivo.get("assistants")):
-        out["assistants"] = _as_list(kelivo["assistants"])
-
-    mcp_raw = _parse_json_str(kelivo.get("mcp_servers_v1"))
-    if isinstance(mcp_raw, list):
-        mcp = [c for e in mcp_raw if isinstance(e, dict)
-               for c in [_convert_mcp_to_rh(e)] if c is not None]
-        out["mcpServers"] = mcp
-
-        dropped_builtin = sum(
-            1 for e in mcp_raw if isinstance(e, dict)
-            and (str(e.get("id") or "") in KL_BUILTIN_MCP_IDS
-                 or str(e.get("name") or "") in KL_BUILTIN_MCP_NAMES))
-        if dropped_builtin:
-            notes.append(f"{dropped_builtin} 个 Kelivo 内置 MCP 服务")
-    elif _as_list(kelivo.get("mcpServers")):
-        out["mcpServers"] = _as_list(kelivo["mcpServers"])
-
-    tts_raw = _parse_json_str(kelivo.get("tts_services_v1"))
-    if isinstance(tts_raw, list):
-        out["ttsProviders"] = [_convert_tts_to_rh(e)
-                               for e in tts_raw if isinstance(e, dict)]
-    elif _as_list(kelivo.get("ttsProviders")):
-        out["ttsProviders"] = _as_list(kelivo["ttsProviders"])
-
-    qp_raw = _parse_json_str(kelivo.get("quick_phrases_v1"))
-    if isinstance(qp_raw, list):
-        out["quickMessages"] = [_convert_quick_phrase_to_rh(e)
-                                for e in qp_raw if isinstance(e, dict)]
-    elif _as_list(kelivo.get("quickMessages")):
-        out["quickMessages"] = _as_list(kelivo["quickMessages"])
-
-    inj_raw = _parse_json_str(kelivo.get("instruction_injections_v1"))
-    if isinstance(inj_raw, list):
-        out["modeInjections"] = [_convert_injection_to_rh(e)
-                                 for e in inj_raw if isinstance(e, dict)]
-    elif _as_list(kelivo.get("modeInjections")):
-        out["modeInjections"] = _as_list(kelivo["modeInjections"])
-
-    wb_raw = _parse_json_str(kelivo.get("world_books_v1"))
-    if isinstance(wb_raw, list):
-        lorebooks = [_convert_world_book_to_rh(e)
-                     for e in wb_raw if isinstance(e, dict)]
-        if lorebooks:
-            out["lorebooks"] = lorebooks
-
-
-    sr_raw = _parse_json_str(kelivo.get("search_services_v1"))
-    if isinstance(sr_raw, list):
-        converted = [_convert_search_to_rh(e)
-                     for e in sr_raw if isinstance(e, dict)]
-        dropped = sum(1 for e in sr_raw if isinstance(e, dict)
-                      and str(e.get("type") or "") not in _SHARED_SEARCH_TYPES)
-        if converted:
-            out["searchServices"] = [c for c in converted if c is not None]
-        if dropped:
-            notes.append(f"{dropped} 个搜索服务（类型不受 RikkaHub 支持）")
-
-    return out, notes
-
-
-# ---------------------------------------------------------------------------
-# RikkaHub -> Kelivo entry converters
-# ---------------------------------------------------------------------------
-
-def _convert_provider_to_kl(entry: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-    pid = str(entry.get("id") or uuidlib.uuid4())
-    builtin = _find_builtin_by_rh_id(pid)
-    kelivo_key = builtin["kelivo_key"] if builtin else pid
-
-    overrides: dict[str, Any] = {}
-    for model in _as_list(entry.get("models")):
-        if not isinstance(model, dict) or not model.get("modelId"):
-            continue
-        name = str(model["modelId"])
-        overrides[name] = {
-            "name": str(model.get("displayName") or name),
-            "type": str(model.get("type") or "CHAT").lower(),
-            "input": _lower_list(model.get("inputModalities"), ["text"]),
-            "output": _lower_list(model.get("outputModalities"), ["text"]),
-            "abilities": _lower_list(model.get("abilities"), []),
-        }
-    out: dict[str, Any] = dict(KL_PROVIDER_DEFAULTS)
-    out["id"] = pid
-    out["enabled"] = bool(entry.get("enabled", True))
-    out["name"] = str(entry.get("name") or (builtin["kelivo_key"] if builtin else ""))
-    out["apiKey"] = str(entry.get("apiKey") or "")
-    out["baseUrl"] = str(entry.get("baseUrl") or "")
-    out["providerType"] = str(entry.get("type") or "openai")
-    if entry.get("chatCompletionsPath") is not None:
-        out["chatPath"] = str(entry["chatCompletionsPath"])
-    if entry.get("useResponseApi") is not None:
-        out["useResponseApi"] = bool(entry["useResponseApi"])
-    if entry.get("vertexAI") is not None:
-        out["vertexAI"] = bool(entry["vertexAI"])
-    if entry.get("projectId") is not None:
-        out["projectId"] = str(entry["projectId"])
-    if entry.get("location") is not None:
-        out["location"] = str(entry["location"])
-    if entry.get("promptCaching") is not None:
-        out["claudePromptCachingEnabled"] = bool(entry["promptCaching"])
-    if entry.get("promptCacheTtl") is not None:
-        out["claudePromptCachingTtl"] = str(entry["promptCacheTtl"])
-    if entry.get("customHeaders") is not None:
-        out["customHeaders"] = _as_list(entry["customHeaders"])
-    if entry.get("customBodies") is not None:
-        out["customBody"] = _as_list(entry["customBodies"])
-    out["models"] = [str(m["modelId"]) for m in _as_list(entry.get("models"))
-                     if isinstance(m, dict) and m.get("modelId")]
-    out["modelOverrides"] = overrides
-    return kelivo_key, out
-
-
-def _convert_assistant_to_kl(
-    entry: dict[str, Any],
-    *,
-    model_by_uuid: dict[str, tuple[str, str]] | None = None,
-) -> dict[str, Any]:
-    out: dict[str, Any] = dict(KL_ASSISTANT_DEFAULTS)
-    out["id"] = _entity_uuid(entry.get("id"), "assistant")
-    out["name"] = str(entry.get("name") or "")
-    # Kelivo stores avatar as a plain String? (path/url/base64, null for
-    # initial-letter avatar) — NOT an object.  RikkaHub's Avatar.Image url
-    # maps onto it directly.
-    avatar = entry.get("avatar")
-    if isinstance(avatar, dict):
-        out["avatar"] = avatar.get("url")
-    else:
-        out["avatar"] = avatar
-    if entry.get("useAssistantAvatar") is not None:
-        out["useAssistantAvatar"] = bool(entry["useAssistantAvatar"])
-    if entry.get("chatModelId") is not None:
-        resolved = None
-        if model_by_uuid is not None:
-            resolved = model_by_uuid.get(str(entry["chatModelId"]))
-        if resolved:
-            out["chatModelProvider"], out["chatModelId"] = resolved
+        if transport == "stdio":
+            payload["command"] = str(entry.get("command") or "")
+            payload["args"] = [str(item) for item in _as_list(entry.get("args"))]
+            payload["env"] = _as_dict(entry.get("env"))
+            if entry.get("workingDirectory"):
+                payload["workingDirectory"] = str(entry["workingDirectory"])
         else:
-            out["chatModelId"] = str(entry["chatModelId"])
-    for field in ("temperature", "topP", "maxTokens", "background"):
-        if entry.get(field) is not None:
-            out[field] = entry[field]
-    if entry.get("streamOutput") is not None:
-        out["streamOutput"] = bool(entry["streamOutput"])
-    for field in ("systemPrompt", "messageTemplate"):
-        if entry.get(field) is not None:
-            value = str(entry[field])
-            if field == "systemPrompt":
-                value = convert_prompt_vars(value, to_rikkahub=False)
-            out[field] = value
-    if entry.get("enableMemory") is not None:
-        out["enableMemory"] = bool(entry["enableMemory"])
-    if entry.get("enableRecentChatsReference") is not None:
-        out["enableRecentChatsReference"] = bool(entry["enableRecentChatsReference"])
-    if entry.get("customHeaders") is not None:
-        out["customHeaders"] = _as_list(entry["customHeaders"])
-    if entry.get("customBodies") is not None:
-        out["customBody"] = _as_list(entry["customBodies"])
-    # RikkaHub enabledSkills (skill names) -> Kelivo skillIds.
-    if entry.get("enabledSkills"):
-        out["skillIds"] = [str(s) for s in _as_list(entry["enabledSkills"])]
-    presets = _as_list(entry.get("presetMessages"))
-    if presets:
-        out["presetMessages"] = json.dumps([
-            {
-                "id": str(p.get("id") or uuidlib.uuid4()),
-                "role": str(p.get("role") or "user"),
-                "content": "\n\n".join(
-                    str(part.get("text") or "")
-                    for part in _as_list(p.get("parts"))
-                    if isinstance(part, dict) and part.get("type") == "text"
-                ),
-            }
-            for p in presets if isinstance(p, dict)
-        ], ensure_ascii=False)
-    now = _now_iso()
-    out["createdAt"] = now
-    out["updatedAt"] = now
-    return out
+            payload["url"] = str(entry.get("url") or "")
+            payload["headers"] = _as_dict(entry.get("headers"))
+        out.append(payload)
+        mapping[str(entry["id"])] = server_id
+    return out, mapping
 
 
-def _convert_mcp_to_kl(entry: dict[str, Any]) -> dict[str, Any] | None:
-    """RikkaHub MCP server -> Kelivo.  Returns None for Kelivo built-ins."""
-    common = entry.get("commonOptions") if isinstance(entry.get("commonOptions"), dict) else {}
-    server_id = str(entry.get("id") or "")
-    server_name = str(common.get("name") or "")
-    if server_id in KL_BUILTIN_MCP_IDS or server_name in KL_BUILTIN_MCP_NAMES:
-        return None  # built-ins are re-added by the converter
-    tools = []
-    for t in _as_list(common.get("tools")):
-        if not isinstance(t, dict):
+def _instructions_r2k(value: Any, diagnostics: list[Diagnostic]
+                      ) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    out: list[dict[str, Any]] = []
+    mapping: dict[str, str] = {}
+    dropped = 0
+    for entry in _as_list(value):
+        if not isinstance(entry, dict) or not entry.get("id"):
             continue
-        tool: dict[str, Any] = {
-            "enabled": bool(t.get("enable", True)),
-            "name": str(t.get("name") or ""),
-            "description": t.get("description"),
-            "params": _schema_to_params(t.get("inputSchema")),
-        }
-        if t.get("inputSchema") is not None:
-            tool["schema"] = t["inputSchema"]
-        if t.get("needsApproval"):
-            tool["needsApproval"] = True
-        tools.append(tool)
-    # Kelivo transports are an enum: sse | http | stdio | inmemory.
-    transport = str(entry.get("type") or "http")
-    if transport == "streamable_http":
-        transport = "http"
-    headers = common.get("headers")
-    kl_headers = None
-    if isinstance(headers, list):
-        pairs = {}
-        for h in headers:
-            if isinstance(h, dict) and h.get("first") is not None:
-                pairs[str(h["first"])] = str(h.get("second") or "")
-            elif isinstance(h, list) and len(h) >= 2 and h[0] is not None:
-                pairs[str(h[0])] = str(h[1])
-        if pairs:
-            kl_headers = pairs
-    out: dict[str, Any] = {
-        "id": _entity_uuid(entry.get("id"), "mcp"),
-        "enabled": bool(common.get("enable", True)),
-        "name": str(common.get("name") or ""),
-        "transport": transport,
-        "tools": tools,
-    }
-    if kl_headers:
-        out["headers"] = kl_headers
-    if transport not in ("stdio", "inmemory"):
-        out["url"] = str(entry.get("url") or "")
-    return out
-
-
-def _convert_tts_to_kl(entry: dict[str, Any]) -> dict[str, Any]:
-    out: dict[str, Any] = {
-        "id": _entity_uuid(entry.get("id"), "tts"),
-        "enabled": True,
-        "name": str(entry.get("name") or ""),
-        "kind": str(entry.get("type") or "openai"),
-    }
-    for field in ("apiKey", "baseUrl"):
-        if entry.get(field) is not None:
-            out[field] = str(entry[field])
-    voice = entry.get("voice") or entry.get("voiceId") or entry.get("voiceName")
-    if voice is not None:
-        out["voiceId"] = str(voice)
-    if entry.get("language") is not None:
-        out["language"] = str(entry["language"])
-    return out
-
-
-def _convert_quick_phrase_to_kl(entry: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "id": _entity_uuid(entry.get("id"), "quick_phrase"),
-        "title": str(entry.get("title") or ""),
-        "content": str(entry.get("content") or ""),
-        "isGlobal": True,
-        "assistantId": None,
-    }
-
-
-def _convert_injection_to_kl(entry: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "id": _entity_uuid(entry.get("id"), "injection"),
-        "title": str(entry.get("name") or ""),
-        "prompt": convert_prompt_vars(
-            str(entry.get("content") or ""), to_rikkahub=False),
-        "group": None,
-    }
-
-
-def _convert_lorebook_to_kl(entry: dict[str, Any]) -> dict[str, Any]:
-    """RikkaHub lorebook -> Kelivo world book."""
-    entries: list[dict[str, Any]] = []
-    for e in _as_list(entry.get("entries")):
-        if not isinstance(e, dict):
+        if entry.get("type") not in (None, "mode"):
+            dropped += 1
             continue
-        position = str(e.get("position") or "after_system_prompt").upper()
-        entries.append({
-            "id": _entity_uuid(e.get("id"), "lorebook_entry"),
-            "name": str(e.get("name") or ""),
-            "enabled": bool(e.get("enabled", True)),
-            "priority": int(e.get("priority") or 0),
-            "position": position,
-            "content": convert_prompt_vars(
-                str(e.get("content") or ""), to_rikkahub=False),
-            "injectDepth": int(e.get("injectDepth") or 4),
-            "role": str(e.get("role") or "user").upper(),
-            "keywords": [str(k) for k in _as_list(e.get("keywords"))],
-            "useRegex": bool(e.get("useRegex", False)),
-            "caseSensitive": bool(e.get("caseSensitive", False)),
-            "scanDepth": int(e.get("scanDepth") or 4),
-            "constantActive": bool(e.get("constantActive", False)),
+        instruction_id = _entity_uuid(entry["id"], "instruction")
+        out.append({
+            "id": instruction_id,
+            "title": str(entry.get("name") or ""),
+            "prompt": str(entry.get("content") or ""),
+            "group": "",
         })
-    return {
-        "id": _entity_uuid(entry.get("id"), "lorebook"),
-        "name": str(entry.get("name") or ""),
-        "description": str(entry.get("description") or ""),
-        "enabled": bool(entry.get("enabled", True)),
-        "entries": entries,
-    }
+        mapping[str(entry["id"])] = instruction_id
+    if dropped:
+        diagnostics.append(_diag(
+            "unsupported_data", "prompt injection", dropped,
+            "非模式注入的提示注入未迁移"))
+    return out, mapping
 
 
-def build_kelivo_settings(rikkahub: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
-    """Convert a RikkaHub settings object into a Kelivo (cuplivo) settings
-    object shaped like a SharedPreferences snapshot."""
-    notes: list[str] = []
-    out: dict[str, Any] = dict(KL_ONLY_DEFAULTS)
+def _quick_phrases_r2k(value: Any) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    out: list[dict[str, Any]] = []
+    mapping: dict[str, str] = {}
+    for entry in _as_list(value):
+        if not isinstance(entry, dict) or not entry.get("id"):
+            continue
+        phrase_id = _entity_uuid(entry["id"], "quick")
+        out.append({
+            "id": phrase_id,
+            "title": str(entry.get("title") or ""),
+            "content": str(entry.get("content") or ""),
+            "isGlobal": True,
+            "assistantId": None,
+        })
+        mapping[str(entry["id"])] = phrase_id
+    return out, mapping
 
-    # 1. shared scalar keys
-    for key in SHARED_KEYS:
-        if key in rikkahub:
-            value = rikkahub[key]
-            # Kelivo restores settings via prefs.restore(), which only
-            # accepts String/bool/int/double/List<String>.  Object-array
-            # values (RikkaHub searchServices/asrProviders/lorebooks/
-            # assistantTags/customThemes) would abort the whole restore and
-            # drop every later key, so they stay empty mirror keys here —
-            # their data travels in the *_v1 JSON strings instead.
-            if isinstance(value, list) and any(
-                    isinstance(v, dict) for v in value):
-                continue
-            if key in _PROMPT_KEYS and isinstance(value, str):
-                value = convert_prompt_vars(value, to_rikkahub=False)
-            out[key] = value
 
-    # 2. providers -> provider_configs_v1
-    providers: dict[str, Any] = {}
-    model_by_uuid: dict[str, tuple[str, str]] = {}
-    for entry in _as_list(rikkahub.get("providers")):
+def _tags_r2k(value: Any) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    out: list[dict[str, Any]] = []
+    mapping: dict[str, str] = {}
+    for entry in _as_list(value):
+        if not isinstance(entry, dict) or not entry.get("id"):
+            continue
+        tag_id = _entity_uuid(entry["id"], "tag")
+        out.append({"id": tag_id, "name": str(entry.get("name") or "")})
+        mapping[str(entry["id"])] = tag_id
+    return out, mapping
+
+
+def _workspaces_r2k(source: Backup,
+                    diagnostics: list[Diagnostic]
+                    ) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    payload = source.payload
+    assert isinstance(payload, RikkaPayload)
+    table = payload.tables.get("workspaces")
+    out: list[dict[str, Any]] = []
+    mapping: dict[str, str] = {}
+    if table is None:
+        return out, mapping
+    columns = {name: index for index, name in enumerate(table.columns)}
+    for row in table.rows:
+        source_id = str(row[columns["id"]])
+        workspace_id = _entity_uuid(source_id, "workspace")
+        mapping[source_id] = workspace_id
+        out.append({
+            "id": workspace_id,
+            "name": str(row[columns["name"]] or ""),
+            "kind": "managed",
+            "hostPath": None,
+            "shellNeedsApproval": True,
+            "defaultCwd": "",
+            "disabledTools": [],
+            "createdAt": ms_to_iso(int(row[columns["created_at"]] or 0)) or "",
+            "updatedAt": ms_to_iso(int(row[columns["updated_at"]] or 0)) or "",
+            "lastUsedAt": None,
+        })
+        diagnostics.append(_diag(
+            "workspace_metadata_only", "workspace", 1,
+            "工作区仅迁移元数据；源 rootfs 内容与执行策略未恢复"))
+    return out, mapping
+
+
+def _source_skills(source: Backup) -> list[model.Skill]:
+    grouped: dict[str, list[str]] = {}
+    for asset in source.assets:
+        if not asset.entry.startswith("skills/"):
+            continue
+        parts = asset.entry.split("/")
+        if len(parts) < 3:
+            continue
+        grouped.setdefault(parts[1], []).append(asset.entry)
+    return [model.Skill(id=name, name=name, entries=entries)
+            for name, entries in grouped.items()]
+
+
+def _flags_from_rikkahub_assistants(
+    assistants: list[dict[str, Any]]) -> dict[str, AssistantMemoryFlags]:
+    flags: dict[str, AssistantMemoryFlags] = {}
+    for assistant in assistants:
+        if not isinstance(assistant, dict) or not assistant.get("id"):
+            continue
+        try:
+            flags[str(assistant["id"])] = AssistantMemoryFlags(
+                use_global=False,
+                enable=bool(assistant.get("enableMemory")),
+            )
+        except KeyError:  # pragma: no cover - defensive
+            continue
+    return flags
+
+
+def _copy_feature_settings_r2k(settings: dict[str, Any],
+                               output: dict[str, Any],
+                               models_by_rh_uuid: dict[str, tuple[str, str]],
+                               *, entity_ids: dict[str, dict[str, str]] | None,
+                               diagnostics: list[Diagnostic]) -> None:
+    for source_key, target_key, kind in (
+            ("chatModelId", "selected_model_v1", "model"),
+            ("titleModelId", "title_model_v1", "model"),
+            ("suggestionModelId", "suggestion_model_v1", "model"),
+            ("translateModeId", "translate_model_v1", "model"),
+            ("ocrModelId", "ocr_model_v1", "model"),
+            ("compressModelId", "compress_model_v1", "model")):
+        value = settings.get(source_key)
+        if isinstance(value, str) and value in models_by_rh_uuid:
+            provider_key, logical = models_by_rh_uuid[value]
+            output[target_key] = f"{provider_key}::{logical}"
+    for source_key, target_key in (
+            ("titlePrompt", "title_prompt_v1"),
+            ("suggestionPrompt", "suggestion_prompt_v1"),
+            ("translatePrompt", "translate_prompt_v1"),
+            ("ocrPrompt", "ocr_prompt_v1"),
+            ("compressPrompt", "compress_prompt_v1")):
+        value = settings.get(source_key)
+        if isinstance(value, str) and value:
+            output[target_key] = convert_prompt_vars(value, to_rikkahub=False)
+    output["title_generation_enabled_v1"] = bool(
+        settings.get("enableAutoTitle", True))
+    output["suggestion_generation_enabled_v1"] = bool(
+        settings.get("enableSuggestion", True))
+    if output.get("ocr_model_v1"):
+        output["ocr_enabled_v1"] = True
+    if isinstance(settings.get("translateTargetLanguage"), str):
+        output["translate_target_lang_v1"] = settings["translateTargetLanguage"]
+    selected_tts = settings.get("selectedTTSProviderId")
+    if isinstance(selected_tts, str):
+        mapped = (
+            (entity_ids or {}).get("tts", {}).get(selected_tts)
+            or (_entity_uuid(selected_tts, "tts") if _is_uuid(selected_tts)
+                else None))
+        if mapped:
+            output["tts_selected_service_id_v1"] = mapped
+    selected_asr = settings.get("selectedASRProviderId")
+    if isinstance(selected_asr, str):
+        mapped = (entity_ids or {}).get("asr", {}).get(selected_asr)
+        if mapped:
+            output["asr_selected_service_id_v1"] = mapped
+
+
+# ---------------------------------------------------------------------------
+# Kelivo source -> RikkaHub target
+# ---------------------------------------------------------------------------
+
+def _kelivo_to_rikkahub(source: Backup,
+                        target: TargetProfile) -> SettingsResult:
+    payload = source.payload
+    assert isinstance(payload, KelivoPayload)
+    source_settings = payload.settings
+    diagnostics: list[Diagnostic] = []
+    providers = _as_dict(_parse(source_settings.get("provider_configs_v1")))
+    order = _as_list(_parse(source_settings.get("providers_order_v1")))
+    ordered_keys = [str(key) for key in order if str(key) in providers]
+    ordered_keys += [str(key) for key in providers if str(key) not in ordered_keys]
+    rh_providers: list[dict[str, Any]] = []
+    provider_ids: dict[str, str] = {}
+    model_ids: dict[tuple[str, str], str] = {}
+    models_by_rh_uuid: dict[str, tuple[str, str]] = {}
+    for key in ordered_keys:
+        entry = providers.get(key)
         if not isinstance(entry, dict):
             continue
-        key, converted = _convert_provider_to_kl(entry)
-        providers[key] = converted
-        for name in converted.get("models") or []:
-            for model in _as_list(entry.get("models")):
-                if isinstance(model, dict) and model.get("modelId") == name:
-                    model_by_uuid[str(model.get("id"))] = (key, str(name))
-                    break
-    if providers:
-        out["provider_configs_v1"] = _json_str(providers)
+        converted = _provider_k2r(str(key), entry, diagnostics)
+        if converted is None:
+            continue
+        rh_provider, aliases = converted
+        rh_providers.append(rh_provider)
+        provider_ids[str(key)] = str(rh_provider["id"])
+        for logical, rh_uuid in aliases:
+            model_ids[(str(key), logical)] = rh_uuid
+            models_by_rh_uuid[rh_uuid] = (str(key), logical)
+    assistants_in = _as_list(_parse(source_settings.get("assistants_v1")))
+    rh_assistants: list[dict[str, Any]] = []
+    assistant_ids: dict[str, str] = {}
+    for assistant in assistants_in:
+        if not isinstance(assistant, dict) or not assistant.get("id"):
+            continue
+        mapped = _assistant_k2r(assistant, models_by_rh_uuid, diagnostics)
+        rh_assistants.append(mapped)
+        assistant_ids[str(assistant["id"])] = str(mapped["id"])
+    mcp_out, mcp_ids = _mcp_k2r(_parse(source_settings.get("mcp_servers_v1")),
+                                diagnostics)
+    instructions_out, instruction_ids = _instructions_k2r(
+        _parse(source_settings.get("instruction_injections_v1")))
+    quick_out, quick_ids = _quick_phrases_k2r(
+        _parse(source_settings.get("quick_phrases_v1")))
+    tags_out, tag_ids = _tags_k2r(_parse(source_settings.get("assistant_tags_v1")))
+    entities = {
+        "mcp": mcp_ids,
+        "instruction": instruction_ids,
+        "worldBook": {},
+        "quickPhrase": quick_ids,
+        "search": {},
+        "tts": {},
+        "asr": {},
+    }
+    settings: dict[str, Any] = {
+        "providers": rh_providers,
+        "assistants": rh_assistants,
+        "mcpServers": mcp_out,
+        "modeInjections": instructions_out,
+        "quickMessages": quick_out,
+        "assistantTags": tags_out,
+        "lorebooks": [],
+        "searchServices": [],
+        "ttsProviders": [],
+        "asrProviders": [],
+        "favoriteModels": [],
+    }
+    _copy_feature_settings_k2r(source_settings, settings, model_ids,
+                               diagnostics)
+    assistant_id = _entity_uuid(
+        assistants_in[0]["id"], "assistant") if assistants_in and isinstance(
+            assistants_in[0], dict) and assistants_in[0].get("id") \
+        else RH_DEFAULT_ASSISTANT_ID
+    if not any(str(a.get("id")) == assistant_id for a in rh_assistants):
+        assistant_id = str(rh_assistants[0]["id"]) if rh_assistants \
+            else RH_DEFAULT_ASSISTANT_ID
+    settings["assistantId"] = assistant_id
+    _resolve_active_models(settings, rh_providers, diagnostics)
+    workspaces_in = _as_list(_parse(source_settings.get("workspaces_v1")))
+    workspace_ids = {
+        str(w.get("id")): _entity_uuid(w.get("id"), "workspace")
+        for w in workspaces_in if isinstance(w, dict) and w.get("id")}
+    skills_in = _as_list(_parse(source_settings.get("skills_v1")))
+    skill_ids = {
+        str(s.get("id")): str(s.get("id")) for s in skills_in
+        if isinstance(s, dict) and s.get("id")}
+    entries, docs = _memory_k2r(source, rh_assistants, assistant_ids,
+                                diagnostics,
+                                legacy_target=target.schema_version is not None
+                                and target.schema_version < 28)
+    for assistant in rh_assistants:
+        if assistant.get("useGlobalMemory") is True:
+            assistant["useGlobalMemory"] = False
+    if _as_list(_parse(source_settings.get("world_books_v1"))):
+        diagnostics.append(_diag(
+            "unsupported_data", "world book",
+            len(_as_list(_parse(source_settings.get("world_books_v1")))),
+            "Kelivo 世界书条目与 RikkaHub 结构不等价，未迁移条目"))
+    return SettingsResult(
+        settings=settings,
+        provider_ids=provider_ids,
+        model_ids=model_ids,
+        assistant_ids=assistant_ids,
+        workspace_ids=workspace_ids,
+        skill_ids=skill_ids,
+        models_by_rh_uuid=models_by_rh_uuid,
+        entity_ids=entities,
+        memory_entries=[],
+        memory_docs=docs,
+        diagnostics=tuple(diagnostics),
+    )
 
-    else:
-        out["provider_configs_v1"] = "{}"
 
-    # Task models (title/suggestion/translate/ocr/compress) -> Kelivo's
-    # "providerKey::modelId" preference format.  RikkaHub's fastModelId is the
-    # fallback for title/suggestion generation when unset, mirroring Kelivo's
-    # own fallback chain, so it is written into those two keys explicitly.
-    def _kl_model_ref(model_uuid: Any) -> str | None:
-        if not model_uuid or not model_by_uuid:
+def _provider_k2r(key: str, entry: dict[str, Any],
+                  diagnostics: list[Diagnostic]
+                  ) -> tuple[dict[str, Any], list[tuple[str, str]]] | None:
+    provider_id = _entity_uuid(key, "provider")
+    oauth = entry.get("oauthProvider")
+    multi_key = bool(entry.get("multiKeyEnabled"))
+    api_keys = _as_list(entry.get("apiKeys"))
+    base: dict[str, Any] = {
+        "id": provider_id,
+        "enabled": bool(entry.get("enabled", True)),
+        "name": str(entry.get("name") or ""),
+        "customHeaders": _headers_k2r(entry.get("customHeaders")),
+        "customBodies": _headers_k2r(entry.get("customBody")),
+        "quotaQuery": _quota_k2r(entry),
+        "includeHistoryReasoning": True,
+    }
+    if isinstance(oauth, str):
+        if oauth not in ("chatgpt", "grok"):
+            diagnostics.append(_diag(
+                "unsupported_data", "provider auth", 1,
+                f"OAuth 提供商 {oauth} 在 RikkaHub 中没有原生账户类型，已丢弃"))
             return None
-        hit = model_by_uuid.get(str(model_uuid))
-        if not hit:
-            return None
-        return f"{hit[0]}::{hit[1]}"
-
-    title_ref = _kl_model_ref(rikkahub.get("titleModelId"))
-    if title_ref is None:
-        title_ref = _kl_model_ref(rikkahub.get("fastModelId"))
-    if title_ref:
-        out["title_model_v1"] = title_ref
-
-    suggestion_ref = _kl_model_ref(rikkahub.get("suggestionModelId"))
-    if suggestion_ref is None:
-        suggestion_ref = _kl_model_ref(rikkahub.get("fastModelId"))
-    if suggestion_ref:
-        out["suggestion_model_v1"] = suggestion_ref
-
-    for rh_key, kl_key in (("translateModeId", "translate_model_v1"),
-                           ("ocrModelId", "ocr_model_v1"),
-                           ("compressModelId", "compress_model_v1")):
-        ref = _kl_model_ref(rikkahub.get(rh_key))
-        if ref:
-            out[kl_key] = ref
-
-    # Default chat model -> Kelivo's current model (selected_model_v1), the
-    # fallback for everything else in Kelivo.
-    chat_ref = _kl_model_ref(rikkahub.get("chatModelId"))
-    if chat_ref:
-        out["selected_model_v1"] = chat_ref
-
-    # 2. user profile (nickname/avatar) from RikkaHub displaySetting
-    display = rikkahub.get("displaySetting")
-    if isinstance(display, dict):
-        nickname = display.get("userNickname")
-        if isinstance(nickname, str) and nickname:
-            out["user_name"] = nickname
-        avatar = display.get("userAvatar")
-        if isinstance(avatar, dict):
-            avatar_type = str(avatar.get("type") or "")
-            if "Emoji" in avatar_type and avatar.get("content"):
-                out["avatar_type"] = "emoji"
-                out["avatar_value"] = str(avatar["content"])
-            elif "Image" in avatar_type and avatar.get("url"):
-                url = str(avatar["url"])
-                if url.startswith("http://") or url.startswith("https://"):
-                    out["avatar_type"] = "url"
-                    out["avatar_value"] = url
-                else:
-                    out["avatar_type"] = "file"
-                    out["avatar_value"] = url[7:] if url.startswith("file://") else url
-
-    # S3 / WebDAV backup destinations.
-    webdav = rikkahub.get("webDavConfig")
-    if isinstance(webdav, dict):
-        out["webdav_config_v1"] = _json_str({
-            "url": str(webdav.get("url") or ""),
-            "username": str(webdav.get("username") or ""),
-            "password": str(webdav.get("password") or ""),
-            "path": str(webdav.get("path") or "kelivo_backups"),
-            "userAgent": "",
-            "includeChats": True,
-            "includeFiles": True,
-        })
-    s3 = rikkahub.get("s3Config")
-    if isinstance(s3, dict):
-        out["s3_config_v1"] = _json_str({
-            "endpoint": str(s3.get("endpoint") or ""),
-            "region": str(s3.get("region") or "us-east-1"),
-            "bucket": str(s3.get("bucket") or ""),
-            "accessKeyId": str(s3.get("accessKeyId") or ""),
-            "secretAccessKey": str(s3.get("secretAccessKey") or ""),
-            "sessionToken": "",
-            # RikkaHub hardcodes the S3 backup prefix to "rikkahub_backups/"
-            # in S3Sync.kt (its S3Config has no prefix field), so keep the
-            # converted Kelivo config pointing at the same bucket location;
-            # the WebDAV path is unrelated and must not leak in here.
-            "prefix": "rikkahub_backups",
-            "pathStyle": bool(s3.get("pathStyle", True)),
-            "userAgent": "",
-            "includeChats": True,
-            "includeFiles": True,
-        })
-
-    # Search services: enable search and carry the selected index/common
-    # options so the converted services actually take effect.
-    if rikkahub.get("searchServices"):
-        out["search_enabled_v1"] = True
-        selected = rikkahub.get("searchServiceSelected")
-        if isinstance(selected, int):
-            out["search_selected_v1"] = selected
-        common = rikkahub.get("searchCommonOptions")
-        if isinstance(common, dict):
-            result_size = common.get("resultSize")
-            out["search_common_v1"] = _json_str({
-                "resultSize": result_size if isinstance(result_size, int) else 10,
-                "timeout": 5000,
-            })
-
-    # 3. assistants -> assistants_v1
-    assistants = [_convert_assistant_to_kl(e, model_by_uuid=model_by_uuid)
-                  for e in _as_list(rikkahub.get("assistants")) if isinstance(e, dict)]
-    if assistants:
-        out["assistants_v1"] = _json_str(assistants)
-        assistant_ids = {a.get("id") for a in assistants}
-        # The assistant RikkaHub was actually used with: its default
-        # assistantId wins when present in the converted list (RikkaHub
-        # merges the built-in default into the user list at read time);
-        # otherwise fall back to the first converted assistant.
-        current = rikkahub.get("assistantId")
-        if not current or _entity_uuid(current, "assistant") not in assistant_ids:
-            current = assistants[0].get("id")
-        if current:
-            out["current_assistant_id_v1"] = _entity_uuid(current, "assistant")
-        dropped_fields = sum(
-            len(set(e.keys()) - _KL_ASSISTANT_KEPT)
-            for e in _as_list(rikkahub.get("assistants")) if isinstance(e, dict))
-        if dropped_fields:
-            notes.append(f"{len(assistants)} 个助手的 {dropped_fields} 个 "
-                         "RikkaHub 独有字段")
+        base["type"] = oauth
+        credential = _credential_k2r(entry.get("oauthCredentials"), diagnostics)
+        base["credential"] = credential
+        base["models"] = []
     else:
-        out["assistants_v1"] = "[]"
+        if multi_key and api_keys:
+            diagnostics.append(_diag(
+                "unsupported_data", "provider auth", 1,
+                "活动的多 API Key 模式在 RikkaHub 中没有等价结构，已丢弃该提供商"))
+            return None
+        if api_keys and not multi_key:
+            diagnostics.append(_diag(
+                "unsupported_data", "provider auth", len(api_keys),
+                "未启用的备用 API Key 未迁移"))
+        provider_type = str(entry.get("providerType") or "").lower()
+        vertex = bool(entry.get("vertexAI"))
+        service_account = entry.get("serviceAccountJson")
+        if provider_type in ("google", "gemini") or vertex or service_account:
+            base["type"] = "google"
+            base["apiKey"] = str(entry.get("apiKey") or "")
+            base["baseUrl"] = str(entry.get("baseUrl")
+                                  or "https://generativelanguage.googleapis.com/v1beta")
+            parsed = _service_account(service_account)
+            if vertex or service_account:
+                if parsed is None:
+                    diagnostics.append(_diag(
+                        "unsupported_data", "provider auth", 1,
+                        "无效的 Vertex AI service account，已丢弃该提供商"))
+                    return None
+                base["vertexAI"] = True
+                base["useServiceAccount"] = True
+                base["privateKey"] = parsed.get("private_key", "")
+                base["serviceAccountEmail"] = parsed.get("client_email", "")
+                base["projectId"] = parsed.get("project_id", "")
+                base["location"] = parsed.get("location", "us-central1")
+            else:
+                base["vertexAI"] = False
+                base["useServiceAccount"] = False
+        elif provider_type in ("claude", "anthropic"):
+            base["type"] = "claude"
+            base["apiKey"] = str(entry.get("apiKey") or "")
+            base["baseUrl"] = str(entry.get("baseUrl")
+                                  or "https://api.anthropic.com/v1")
+            base["promptCaching"] = bool(
+                entry.get("claudePromptCachingEnabled"))
+            base["promptCacheTtl"] = (
+                "1h" if entry.get("claudePromptCachingTtl") == "1h"
+                else "5m")
+        else:
+            base["type"] = "openai"
+            base["apiKey"] = str(entry.get("apiKey") or "")
+            base["baseUrl"] = str(entry.get("baseUrl")
+                                  or "https://api.openai.com/v1")
+            base["chatCompletionsPath"] = str(
+                entry.get("chatPath") or "/chat/completions")
+            base["useResponseApi"] = bool(entry.get("useResponseApi"))
+        base["models"] = []
+    aliases: list[tuple[str, str]] = []
+    base["models"] = []
+    for logical in _as_list(entry.get("models")):
+        if not isinstance(logical, str) or not logical:
+            continue
+        rh_uuid = _model_uuid(provider_id, logical)
+        override = _as_dict(_as_dict(entry.get("modelOverrides")).get(logical))
+        model: dict[str, Any] = {
+            "modelId": str(override.get("apiModelId") or logical),
+            "displayName": str(override.get("name") or logical),
+            "id": rh_uuid,
+            "type": {"image": "IMAGE", "embedding": "EMBEDDING"}.get(
+                str(override.get("type") or "chat").lower(), "CHAT"),
+            "customHeaders": [],
+            "customBodies": [],
+            "inputModalities": _uppercase(
+                override.get("input"), ["TEXT"]),
+            "outputModalities": _uppercase(
+                override.get("output"), ["TEXT"]),
+            "abilities": _uppercase(override.get("abilities"), []),
+            "tools": [],
+            "providerOverwrite": None,
+        }
+        base["models"].append(model)
+        aliases.append((logical, rh_uuid))
+        api_model = override.get("apiModelId")
+        if isinstance(api_model, str) and api_model and api_model != logical:
+            # Provider-embedded request name: usable as an alias only when it
+            # names exactly one model inside this provider.
+            aliases.append((api_model, rh_uuid))
+    if not base["models"]:
+        diagnostics.append(_diag(
+            "unsupported_data", "provider", 1,
+            "提供商没有可表达的模型，已丢弃"))
+        return None
+    return base, aliases
 
-    # 4. mcpServers -> mcp_servers_v1 (Kelivo's three built-in in-memory
-    # servers are always present; user servers are appended)
-    mcp = [_convert_mcp_to_kl(e)
-           for e in _as_list(rikkahub.get("mcpServers")) if isinstance(e, dict)]
-    mcp = [m for m in mcp if m is not None]
-    out["mcp_servers_v1"] = _json_str([dict(b) for b in KL_BUILTIN_MCPS] + mcp)
 
-    # 5. ttsProviders -> tts_services_v1 + tts_selected_v1
-    tts = [_convert_tts_to_kl(e)
-           for e in _as_list(rikkahub.get("ttsProviders")) if isinstance(e, dict)]
-    out["tts_services_v1"] = _json_str(tts) if tts else "[]"
-    selected = rikkahub.get("selectedTTSProviderId")
-    if selected is not None:
-        for i, t in enumerate(tts):
-            if t.get("id") == str(selected):
-                out["tts_selected_v1"] = i
-                break
+def _headers_k2r(value: Any) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    for entry in _as_list(value):
+        if isinstance(entry, dict):
+            name = entry.get("name") or entry.get("key")
+            header_value = entry.get("value")
+            if isinstance(name, str) and name and isinstance(header_value, str):
+                out.append({"name": name, "value": header_value})
+    return out
 
-    # 6. quickMessages -> quick_phrases_v1
-    qp = [_convert_quick_phrase_to_kl(e)
-          for e in _as_list(rikkahub.get("quickMessages")) if isinstance(e, dict)]
-    out["quick_phrases_v1"] = _json_str(qp) if qp else "[]"
 
-    # 7. modeInjections -> instruction_injections_v1
-    inj = [_convert_injection_to_kl(e)
-           for e in _as_list(rikkahub.get("modeInjections")) if isinstance(e, dict)]
-    out["instruction_injections_v1"] = _json_str(inj) if inj else "[]"
+def _quota_k2r(entry: dict[str, Any]) -> dict[str, Any]:
+    enabled = bool(entry.get("balanceEnabled"))
+    api_path = str(entry.get("balanceApiPath") or "/credits")
+    headers = [{"name": "Authorization", "value": "Bearer {{apiKey}}"}]
+    return {
+        "enabled": enabled,
+        "url": api_path if api_path.startswith("http") else "{{baseUrl}}" + api_path,
+        "headers": headers,
+        "resultPath": str(entry.get("balanceResultPath")
+                          or "data.total_usage"),
+    }
 
-    # 8. lorebooks -> world_books_v1
-    wb = [_convert_lorebook_to_kl(e)
-          for e in _as_list(rikkahub.get("lorebooks")) if isinstance(e, dict)]
-    if wb:
-        out["world_books_v1"] = _json_str(wb)
 
-    # 9. searchServices -> search_services_v1
-    sr = [_convert_search_to_kl(e)
-          for e in _as_list(rikkahub.get("searchServices")) if isinstance(e, dict)]
-    dropped = sum(1 for e in _as_list(rikkahub.get("searchServices"))
-                  if isinstance(e, dict)
-                  and str(e.get("type") or "") not in _SHARED_SEARCH_TYPES)
-    if sr:
-        out["search_services_v1"] = _json_str([s for s in sr if s is not None])
-    if dropped:
-        notes.append(f"{dropped} 个搜索服务（类型不受 Kelivo 支持）")
+def _service_account(raw: Any) -> dict[str, Any] | None:
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    if not parsed.get("private_key") or not parsed.get("client_email"):
+        return None
+    return parsed
 
-    return out, notes
+
+def _credential_k2r(credentials: Any,
+                    diagnostics: list[Diagnostic]) -> dict[str, Any] | None:
+    if not isinstance(credentials, dict):
+        return None
+    if credentials.get("requiresLogin") is True:
+        diagnostics.append(_diag(
+            "unsupported_data", "oauth credential", 1,
+            "源会话要求重新登录，目标保持未登录"))
+        return None
+    access = credentials.get("accessToken")
+    refresh = credentials.get("refreshToken")
+    expires = credentials.get("expiresAt")
+    expires_ms = iso_to_ms(expires) if isinstance(expires, str) else None
+    if not isinstance(access, str) or not access \
+            or not isinstance(refresh, str) or not refresh \
+            or not expires_ms:
+        diagnostics.append(_diag(
+            "unsupported_data", "oauth credential", 1,
+            "凭据缺少可用的 refresh token 或过期时间，目标保持未登录"))
+        return None
+    for key in ("sessionId", "deviceId", "organizationId", "organizationName"):
+        if credentials.get(key):
+            diagnostics.append(_diag(
+                "unsupported_data", "oauth metadata", 1,
+                f"{key} 在 RikkaHub 中没有等价字段"))
+    return {
+        "accessToken": access,
+        "refreshToken": refresh,
+        "expiresAt": expires_ms,
+        "accountId": credentials.get("accountId")
+        if isinstance(credentials.get("accountId"), str) else None,
+        "email": credentials.get("email")
+        if isinstance(credentials.get("email"), str) else None,
+        "plan": credentials.get("plan")
+        if isinstance(credentials.get("plan"), str) else None,
+    }
+
+
+def _uppercase(value: Any, default: list[str]) -> list[str]:
+    if not isinstance(value, list):
+        return list(default)
+    out = [str(item).upper() for item in value]
+    return out or list(default)
+
+
+def _assistant_k2r(assistant: dict[str, Any],
+                   models_by_rh_uuid: dict[str, tuple[str, str]],
+                   diagnostics: list[Diagnostic]) -> dict[str, Any]:
+    provider = assistant.get("chatModelProvider")
+    model_id = assistant.get("chatModelId")
+    rh_model = None
+    if isinstance(model_id, str) and model_id:
+        if isinstance(provider, str) and provider:
+            rh_model = next((rh_uuid for rh_uuid, (key, logical) in
+                             models_by_rh_uuid.items()
+                             if key == provider and logical == model_id), None)
+        else:
+            matches = [rh_uuid for rh_uuid, (key, logical) in
+                       models_by_rh_uuid.items() if logical == model_id]
+            if len(matches) == 1:
+                rh_model = matches[0]
+        if rh_model is None:
+            diagnostics.append(_diag(
+                "identity_reference_unresolved", "assistant model", 1,
+                "助手的模型引用无法映射，已清空该助手的模型"))
+    presets = []
+    for preset in _as_list(_parse(assistant.get("presetMessages"))):
+        if not isinstance(preset, dict):
+            continue
+        role = preset.get("role") if preset.get("role") in (
+            "user", "assistant") else "user"
+        presets.append({
+            "id": _entity_uuid(preset.get("id") or _entity_uuid(
+                f"{assistant.get('id')}:preset", "preset"), "preset"),
+            "role": role,
+            "parts": [{"type": "text",
+                       "text": str(preset.get("content") or ""),
+                       "metadata": None}],
+            "annotations": [],
+        })
+    if _as_list(_parse(assistant.get("regexRules"))):
+        diagnostics.append(_diag(
+            "unsupported_data", "assistant regex",
+            len(_as_list(_parse(assistant.get("regexRules")))),
+            "Kelivo 助手正则规则在 RikkaHub 中没有等价结构"))
+    local_tools = [item for item in _as_list(assistant.get("localToolIds"))
+                   if isinstance(item, str)]
+    mcp_ids = [_entity_uuid(item, "mcp")
+               for item in _as_list(assistant.get("mcpServerIds"))
+               if isinstance(item, str)]
+    skill_ids = [str(item) for item in _as_list(assistant.get("skillIds"))
+                 if isinstance(item, str)]
+    context_size = assistant.get("contextMessageSize")
+    limit = bool(assistant.get("limitContextMessages"))
+    avatar = assistant.get("avatar")
+    if isinstance(avatar, str) and avatar:
+        avatar_value = {"type": "me.rerere.rikkahub.data.model.Avatar.Image",
+                        "url": avatar}
+    else:
+        avatar_value = RH_AVATAR_DUMMY
+    return {
+        "id": _entity_uuid(assistant["id"], "assistant"),
+        "name": str(assistant.get("name") or ""),
+        "avatar": avatar_value,
+        "useAssistantAvatar": bool(assistant.get("useAssistantAvatar")),
+        "chatModelId": rh_model,
+        "systemPrompt": convert_prompt_vars(
+            str(assistant.get("systemPrompt") or ""), to_rikkahub=True),
+        "temperature": assistant.get("temperature"),
+        "topP": assistant.get("topP"),
+        "contextMessageLimit": int(context_size)
+        if limit and isinstance(context_size, int) else 0,
+        "streamOutput": bool(assistant.get("streamOutput", True)),
+        "enableMemory": bool(assistant.get("enableMemory")),
+        "useGlobalMemory": False,
+        "autoConsolidateMemory": bool(assistant.get("autoOrganizeMemory")),
+        "enableRecentChatsReference": bool(
+            assistant.get("allowPastConversationRecall")
+            or assistant.get("enableRecentChatsReference")),
+        "messageTemplate": str(assistant.get("messageTemplate")
+                               or "{{ message }}"),
+        "presetMessages": presets,
+        "quickMessageIds": [],
+        "regexes": [],
+        "reasoningLevel": "AUTO",
+        "maxTokens": assistant.get("maxTokens"),
+        "customHeaders": _headers_k2r(assistant.get("customHeaders")),
+        "customBodies": _headers_k2r(assistant.get("customBody")),
+        "mcpServers": mcp_ids,
+        "localTools": local_tools or ["time_info"],
+        "enableWebSearch": bool(assistant.get("searchEnabled")),
+        "workspaceId": _entity_uuid(assistant["defaultWorkspaceId"], "workspace")
+        if isinstance(assistant.get("defaultWorkspaceId"), str)
+        and assistant["defaultWorkspaceId"] else None,
+        "background": assistant.get("background")
+        if isinstance(assistant.get("background"), str) else None,
+        "backgroundOpacity": 1.0,
+        "useGradientBackground": bool(assistant.get("useGradientBackground")),
+        "modeInjectionIds": [],
+        "lorebookIds": [],
+        "enabledSkills": skill_ids,
+        "enableTimeReminder": bool(assistant.get("enableTimeInjection")),
+        "allowConversationSystemPrompt": bool(
+            assistant.get("allowConversationSystemPrompt")),
+    }
+
+
+def _mcp_k2r(value: Any, diagnostics: list[Diagnostic]
+             ) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    out: list[dict[str, Any]] = []
+    mapping: dict[str, str] = {}
+    for entry in _as_list(value):
+        if not isinstance(entry, dict) or not entry.get("id"):
+            continue
+        server_id = _entity_uuid(entry["id"], "mcp")
+        transport = str(entry.get("transport") or "")
+        if transport == "inmemory":
+            diagnostics.append(_diag(
+                "unsupported_data", "mcp server", 1,
+                "Kelivo 内置 MCP 服务在 RikkaHub 中没有等价实现"))
+            continue
+        if transport not in ("sse", "streamable_http", "stdio"):
+            diagnostics.append(_diag(
+                "unsupported_data", "mcp server", 1,
+                f"未知的 MCP 传输类型 {transport}"))
+            continue
+        payload: dict[str, Any] = {
+            "id": server_id,
+            "enabled": bool(entry.get("enabled", True)),
+            "name": str(entry.get("name") or ""),
+            "type": transport,
+        }
+        if transport == "stdio":
+            payload["command"] = str(entry.get("command") or "")
+            payload["args"] = [str(item) for item in _as_list(entry.get("args"))]
+            payload["env"] = _as_dict(entry.get("env"))
+            if entry.get("workingDirectory"):
+                payload["workingDirectory"] = str(entry["workingDirectory"])
+        else:
+            payload["url"] = str(entry.get("url") or "")
+            payload["headers"] = _as_dict(entry.get("headers"))
+        out.append(payload)
+        mapping[str(entry["id"])] = server_id
+    return out, mapping
+
+
+def _instructions_k2r(value: Any) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    out: list[dict[str, Any]] = []
+    mapping: dict[str, str] = {}
+    for entry in _as_list(value):
+        if not isinstance(entry, dict) or not entry.get("id"):
+            continue
+        instruction_id = _entity_uuid(entry["id"], "instruction")
+        out.append({
+            "id": instruction_id,
+            "type": "mode",
+            "name": str(entry.get("title") or ""),
+            "enabled": True,
+            "priority": 0,
+            "position": "after_system_prompt",
+            "content": str(entry.get("prompt") or ""),
+            "injectDepth": 4,
+            "role": "user",
+        })
+        mapping[str(entry["id"])] = instruction_id
+    return out, mapping
+
+
+def _quick_phrases_k2r(value: Any) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    out: list[dict[str, Any]] = []
+    mapping: dict[str, str] = {}
+    for entry in _as_list(value):
+        if not isinstance(entry, dict) or not entry.get("id"):
+            continue
+        phrase_id = _entity_uuid(entry["id"], "quick")
+        out.append({
+            "id": phrase_id,
+            "title": str(entry.get("title") or ""),
+            "content": str(entry.get("content") or ""),
+        })
+        mapping[str(entry["id"])] = phrase_id
+    return out, mapping
+
+
+def _tags_k2r(value: Any) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    out: list[dict[str, Any]] = []
+    mapping: dict[str, str] = {}
+    for entry in _as_list(value):
+        if not isinstance(entry, dict) or not entry.get("id"):
+            continue
+        tag_id = _entity_uuid(entry["id"], "tag")
+        out.append({"id": tag_id, "name": str(entry.get("name") or "")})
+        mapping[str(entry["id"])] = tag_id
+    return out, mapping
+
+
+def _copy_feature_settings_k2r(source: dict[str, Any], output: dict[str, Any],
+                               model_ids: dict[tuple[str, str], str],
+                               diagnostics: list[Diagnostic]) -> None:
+    def _resolve(raw: Any) -> str | None:
+        if not isinstance(raw, str) or "::" not in raw:
+            return None
+        provider, _, logical = raw.partition("::")
+        return model_ids.get((provider, logical))
+
+    selected = _resolve(source.get("selected_model_v1"))
+    chat_models = [uuid for (_key, _logical), uuid in model_ids.items()]
+    if selected:
+        output["chatModelId"] = selected
+    elif chat_models:
+        output["chatModelId"] = chat_models[0]
+    for source_key, target_key in (
+            ("title_model_v1", "titleModelId"),
+            ("suggestion_model_v1", "suggestionModelId"),
+            ("translate_model_v1", "translateModeId"),
+            ("ocr_model_v1", "ocrModelId"),
+            ("compress_model_v1", "compressModelId"),
+            ("fast_model_v1", "fastModelId")):
+        mapped = _resolve(source.get(source_key))
+        if mapped:
+            output[target_key] = mapped
+    for source_key, target_key in (
+            ("title_prompt_v1", "titlePrompt"),
+            ("suggestion_prompt_v1", "suggestionPrompt"),
+            ("translate_prompt_v1", "translatePrompt"),
+            ("ocr_prompt_v1", "ocrPrompt"),
+            ("compress_prompt_v1", "compressPrompt")):
+        value = source.get(source_key)
+        if isinstance(value, str) and value:
+            output[target_key] = convert_prompt_vars(value, to_rikkahub=True)
+    output["enableAutoTitle"] = bool(
+        source.get("title_generation_enabled_v1", True))
+    output["enableSuggestion"] = bool(
+        source.get("suggestion_generation_enabled_v1", True))
+    if isinstance(source.get("translate_target_lang_v1"), str):
+        output["translateTargetLanguage"] = source["translate_target_lang_v1"]
+    if isinstance(source.get("translate_thinking_budget_v1"), int):
+        output["translateThinkingBudget"] = source["translate_thinking_budget_v1"]
+
+
+def _resolve_active_models(settings: dict[str, Any],
+                           providers: list[dict[str, Any]],
+                           diagnostics: list[Diagnostic]) -> None:
+    models = [entry for provider in providers
+              for entry in provider.get("models", [])
+              if isinstance(entry, dict)]
+    by_id = {str(entry.get("id")) for entry in models}
+    if settings.get("chatModelId") not in by_id:
+        if models:
+            settings["chatModelId"] = models[0]["id"]
+        else:
+            settings.pop("chatModelId", None)
+    for key in ("titleModelId", "suggestionModelId", "translateModeId",
+                "ocrModelId", "compressModelId", "fastModelId",
+                "imageGenerationModelId"):
+        if key in settings and settings[key] not in by_id:
+            settings.pop(key, None)
+            diagnostics.append(_diag(
+                "identity_reference_unresolved", "settings model", 1,
+                f"{key} 指向的模型不在可迁移范围内，已清空"))
+
+
+# ---------------------------------------------------------------------------
+# Memory projection
+# ---------------------------------------------------------------------------
+
+def _assistant_flags_from_rh_settings(
+    settings: dict[str, Any]) -> dict[str, AssistantMemoryFlags]:
+    flags: dict[str, AssistantMemoryFlags] = {}
+    for assistant in _as_list(settings.get("assistants")):
+        if not isinstance(assistant, dict) or not assistant.get("id"):
+            continue
+        flags[str(assistant["id"])] = AssistantMemoryFlags(
+            use_global=bool(assistant.get("useGlobalMemory")),
+            enable=bool(assistant.get("enableMemory", True)),
+        )
+    return flags
+
+
+def _memory_r2k(source: Backup, assistants: list[dict[str, Any]],
+                settings: SettingsResult,
+                *, source_flags: dict[str, AssistantMemoryFlags]
+                ) -> tuple[list[MemoryEntry], list[Diagnostic]]:
+    """RikkaHub markdown files -> Kelivo typed entries."""
+    diagnostics: list[Diagnostic] = []
+    payload = source.payload
+    assert isinstance(payload, RikkaPayload)
+    docs: list[MemoryDoc] = []
+    legacy_entries: list[MemoryEntry] = []
+    memory_table = payload.tables.get("memory_file")
+    if memory_table is not None:
+        assistant_index = memory_table.columns.index("assistant_id")
+        path_index = memory_table.columns.index("path")
+        content_index = memory_table.columns.index("content")
+        updated_index = memory_table.columns.index("updated_at")
+        for row in memory_table.rows:
+            docs.append(MemoryDoc(
+                assistant_id=str(row[assistant_index]),
+                path=str(row[path_index]),
+                content=str(row[content_index] or ""),
+                updated_ms=int(row[updated_index] or 0),
+            ))
+    legacy_table = payload.tables.get("MemoryEntity")
+    if legacy_table is not None:
+        assistant_index = legacy_table.columns.index("assistant_id")
+        content_index = legacy_table.columns.index("content")
+        for row in legacy_table.rows:
+            legacy_entries.append(MemoryEntry(
+                id=str(uuidlib.uuid5(
+                    _MEMORY_NS,
+                    f"legacy:{row[assistant_index]}:{row[content_index]}")),
+                scope="assistant",
+                assistant_id=str(row[assistant_index]),
+                type="instruction",
+                status="active",
+                content=str(row[content_index] or ""),
+                source="manual",
+            ))
+    entries: list[MemoryEntry] = []
+    flag_map = {str(a["id"]): a for a in assistants}
+    dropped_blank = 0
+    global_opt_in = {
+        assistant_id for assistant_id, flags in source_flags.items()
+        if flags.use_global and assistant_id in flag_map}
+    for doc in docs:
+        if not doc.content.strip():
+            dropped_blank += 1
+            continue
+        if doc.assistant_id == "__global__":
+            targets = global_opt_in
+        else:
+            targets = {_entity_uuid(doc.assistant_id, "assistant")}
+        for owner in targets:
+            if owner not in flag_map:
+                diagnostics.append(_diag(
+                    "memory_visibility_changed", "memory", 1,
+                    "共享记忆的目标助手不在迁移范围内，已跳过"))
+                continue
+            status = "active"
+            if doc.assistant_id == "__global__":
+                status = "active"
+            elif source_flags.get(owner) and source_flags[owner].use_global:
+                status = "archived"
+            entry = MemoryEntry(
+                id=str(uuidlib.uuid5(
+                    _MEMORY_NS, f"{doc.assistant_id}:{doc.path}:{owner}")),
+                scope="assistant",
+                assistant_id=owner,
+                type="identity" if doc.path == "/profile.md" else "instruction",
+                status=status,
+                content=doc.content,
+                source="manual",
+                created_us=doc.updated_ms * 1000,
+                updated_us=doc.updated_ms * 1000,
+            )
+            entries.append(entry)
+    for entry in legacy_entries:
+        if not entry.content.strip():
+            dropped_blank += 1
+            continue
+        entry.assistant_id = _entity_uuid(entry.assistant_id, "assistant")
+        entries.append(entry)
+    if dropped_blank:
+        diagnostics.append(_diag(
+            "memory_blank_content_unsupported", "memory", dropped_blank,
+            "空白记忆文件无法通过目标校验，已丢弃"))
+    if docs:
+        diagnostics.append(_diag(
+            "value_defaulted", "memory", len(docs),
+            "源记忆没有创建时钟，createdAt 使用 updatedAt"))
+    if any(doc.assistant_id == "__global__" for doc in docs):
+        if global_opt_in:
+            diagnostics.append(_diag(
+                "memory_visibility_changed", "memory", len(global_opt_in),
+                "共享记忆变成每个助手的独立副本"))
+        else:
+            diagnostics.append(_diag(
+                "unsupported_data", "memory", 1,
+                "没有启用共享记忆的助手，共享文件已丢弃"))
+    return entries, diagnostics
+
+
+def _memory_entry_payload(entry: MemoryEntry) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "id": entry.id,
+        "scope": entry.scope,
+        "assistantId": entry.assistant_id,
+        "type": entry.type,
+        "status": entry.status,
+        "content": entry.content,
+        "source": entry.source,
+        "relatedIds": entry.related_ids,
+        "createdAt": entry.created_us,
+        "updatedAt": entry.updated_us,
+    }
+    return payload
+
+
+def _memory_k2r(source: Backup, assistants: list[dict[str, Any]],
+                assistant_ids: dict[str, str],
+                diagnostics: list[Diagnostic], *,
+                legacy_target: bool = False
+                ) -> tuple[list[MemoryEntry], list[MemoryDoc]]:
+    """Kelivo typed entries -> RikkaHub markdown files."""
+    payload = source.payload
+    assert isinstance(payload, KelivoPayload)
+    settings = payload.settings
+    entries: list[MemoryEntry] = []
+    raw = _as_list(_parse(settings.get("memory_entries_v1")))
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            continue
+        content = item.get("content")
+        if not isinstance(content, str):
+            continue
+        entries.append(MemoryEntry(
+            id=str(item.get("id") or f"memory-{index}"),
+            scope=str(item.get("scope") or "assistant"),
+            assistant_id=item.get("assistantId")
+            if isinstance(item.get("assistantId"), str) else None,
+            type=str(item.get("type") or "instruction"),
+            status=str(item.get("status") or "active"),
+            content=content,
+            source=str(item.get("source") or "manual"),
+            created_us=int(item.get("createdAt") or 0)
+            if isinstance(item.get("createdAt"), int) else 0,
+            updated_us=int(item.get("updatedAt") or 0)
+            if isinstance(item.get("updatedAt"), int) else 0,
+            native={"payload": dict(item)},
+        ))
+    legacy = payload.tables.get("assistant_memory_rows")
+    if legacy is not None:
+        assistant_index = legacy.columns.index("assistant_id")
+        payload_index = legacy.columns.index("payload")
+        for row in legacy.rows:
+            data = _as_dict(_parse(row[payload_index]))
+            content = data.get("content")
+            if not isinstance(content, str):
+                continue
+            entries.append(MemoryEntry(
+                id=str(data.get("id") or uuidlib.uuid5(
+                    _MEMORY_NS, str(row[payload_index]))),
+                scope="assistant",
+                assistant_id=str(row[assistant_index]),
+                type="instruction",
+                status="active",
+                content=content,
+                source="manual",
+            ))
+    blank = [entry for entry in entries if not entry.content.strip()]
+    if blank:
+        diagnostics.append(_diag(
+            "memory_blank_content_unsupported", "memory", len(blank),
+            "空白记忆条目无法通过目标校验，已丢弃"))
+    entries = [entry for entry in entries if entry.content.strip()]
+    active = [entry for entry in entries if entry.status == "active"]
+    archived = len(entries) - len(active)
+    if archived:
+        diagnostics.append(_diag(
+            "unsupported_data", "memory", archived,
+            "RikkaHub 记忆没有 archived 状态，已丢弃归档条目"))
+    target_assistants = [str(a["id"]) for a in assistants if a.get("id")]
+    global_entries = [entry for entry in active if entry.scope == "global"]
+    private: dict[str, list[MemoryEntry]] = {}
+    for entry in active:
+        if entry.scope == "global":
+            continue
+        owner = entry.assistant_id or ""
+        private.setdefault(owner, []).append(entry)
+    target_has_memory = bool(target_assistants)
+    docs: list[MemoryDoc] = []
+    if global_entries and not target_has_memory:
+        diagnostics.append(_diag(
+            "unsupported_data", "memory", len(global_entries),
+            "目标没有助手，全局记忆无处放置"))
+    skipped_orphans = 0
+    for owner in target_assistants:
+        selected = list(global_entries) + list(private.get(owner, []))
+        if not selected:
+            continue
+        if legacy_target:
+            docs.extend(_legacy_memory_docs(owner, selected, diagnostics))
+        else:
+            docs.extend(_aggregate_memory(owner, selected, diagnostics))
+    used = set(target_assistants)
+    for owner, owner_entries in private.items():
+        if owner in used:
+            continue
+        if not owner_entries:
+            continue
+        mapped_owner = _entity_uuid(owner, "assistant") if owner else str(
+            uuidlib.uuid5(_MEMORY_NS, "orphan"))
+        if legacy_target:
+            docs.extend(_legacy_memory_docs(
+                mapped_owner, owner_entries, diagnostics))
+        else:
+            docs.extend(_aggregate_memory(
+                mapped_owner, owner_entries, diagnostics))
+        skipped_orphans += 1
+    if skipped_orphans:
+        diagnostics.append(_diag(
+            "memory_visibility_changed", "memory", skipped_orphans,
+            "没有对应助手的私有记忆按确定身份保留"))
+    if global_entries and target_has_memory:
+        diagnostics.append(_diag(
+            "memory_visibility_changed", "memory", len(global_entries),
+            "全局记忆已写入每个助手的独立记忆库"))
+    return [], docs
+
+
+def _legacy_memory_docs(owner: str, entries: list[MemoryEntry],
+                        diagnostics: list[Diagnostic]) -> list[MemoryDoc]:
+    docs: list[MemoryDoc] = []
+    for entry in entries:
+        if not entry.content.strip():
+            continue
+        docs.append(MemoryDoc(
+            assistant_id=owner,
+            path=f"/memory/{entry.id}.md",
+            content=entry.content,
+            updated_ms=entry.updated_us // 1000,
+        ))
+    return docs
+
+
+def _aggregate_memory(owner: str, entries: list[MemoryEntry],
+                      diagnostics: list[Diagnostic]) -> list[MemoryDoc]:
+    identity = sorted(
+        (entry for entry in entries if entry.type == "identity"),
+        key=lambda item: (item.created_us, item.id))
+    instructions = sorted(
+        (entry for entry in entries if entry.type != "identity"),
+        key=lambda item: (_MEMORY_SECTION_ORDER.index(item.type)
+                          if item.type in _MEMORY_SECTION_ORDER else 3,
+                          item.created_us, item.id))
+    docs: list[MemoryDoc] = []
+    updated = max((entry.updated_us for entry in entries), default=0) // 1000
+    if identity:
+        content = _memory_document("Identity", identity)
+        docs.append(_memory_doc(owner, "/profile.md", content, updated,
+                                diagnostics))
+    if instructions:
+        sections: dict[str, list[MemoryEntry]] = {}
+        for entry in instructions:
+            name = entry.type if entry.type in _MEMORY_SECTION_ORDER \
+                else "instruction"
+            sections.setdefault(name, []).append(entry)
+        parts = []
+        for name in _MEMORY_SECTION_ORDER:
+            if name in sections:
+                parts.append(_memory_document(name.title(), sections[name]))
+        docs.append(_memory_doc(owner, "/preferences.md", "\n\n".join(parts),
+                                updated, diagnostics))
+    if updated == 0:
+        diagnostics.append(_diag(
+            "value_defaulted", "memory", 1,
+            "源记忆没有时钟，文件 updated_at 为 0"))
+    return docs
+
+
+def _memory_document(heading: str, entries: list[MemoryEntry]) -> str:
+    lines = [f"## {heading}"]
+    for index, entry in enumerate(entries, start=1):
+        lines.append("")
+        lines.append(f"### Memory {index}")
+        lines.append(entry.content)
+    return "\n".join(lines)
+
+
+def _memory_doc(owner: str, path: str, content: str, updated_ms: int,
+                diagnostics: list[Diagnostic]) -> MemoryDoc:
+    if len(content.encode("utf-8")) > 48 * 1024:
+        diagnostics.append(_diag(
+            "value_defaulted", "memory", 1,
+            "记忆文件超过 48KiB，目标应用的原生编辑增长限制可能影响后续扩展"))
+    return MemoryDoc(assistant_id=owner, path=path, content=content,
+                     updated_ms=updated_ms, pinned=path in (
+                         "/profile.md", "/preferences.md"))

@@ -6,7 +6,9 @@ from contextlib import contextmanager
 from typing import Iterable
 
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
+from rich.text import Text
 
 console = Console(highlight=False)
 _error_console = Console(highlight=False, stderr=True)
@@ -23,23 +25,23 @@ def banner() -> None:
 
 def comment(msg: str) -> None:
     """Dim '#'-prefixed annotation line, like `gh` comments."""
-    console.print(f"[dim]# {msg}[/dim]")
+    console.print(f"[dim]# {escape(msg)}[/dim]")
 
 
 def ok(msg: str) -> None:
-    console.print(f"[bold green]✓[/bold green] {msg}")
+    console.print(f"[bold green]✓[/bold green] {escape(msg)}")
 
 
 def warn(msg: str) -> None:
-    console.print(f"[bold yellow]![/bold yellow] {msg}")
+    _error_console.print(f"[bold yellow]![/bold yellow] {escape(msg)}")
 
 
 def err(msg: str) -> None:
-    _error_console.print(f"[bold red]✗[/bold red] {msg}")
+    _error_console.print(f"[bold red]✗[/bold red] {escape(msg)}")
 
 
 def info(msg: str) -> None:
-    console.print(f"[bold cyan]>[/bold cyan] {msg}")
+    console.print(f"[bold cyan]>[/bold cyan] {escape(msg)}")
 
 
 @contextmanager
@@ -62,7 +64,8 @@ def summary_box(title: str, rows: Iterable[tuple[str, str]]) -> None:
     table.add_column("key", style="dim", no_wrap=True)
     table.add_column("value", style="bold")
     for key, value in rows:
-        table.add_row(key, value)
+        table.add_row(Text(str(key), style="dim"),
+                      Text(str(value), style="bold"))
     console.print(table)
 
 

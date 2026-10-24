@@ -71,6 +71,10 @@ $nuitkaArgs = @(
     "--include-package=rikkelivo",
     "--include-package=click",
     "--include-package=rich",
+    "--include-package=questionary",
+    "--include-package=prompt_toolkit",
+    "--include-package=wcwidth",
+    "--include-package-data=rikkelivo",
     "src\rikkelivo\cli.py"
 )
 & $py -m nuitka $nuitkaArgs

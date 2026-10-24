@@ -57,6 +57,10 @@ echo "→ Nuitka onefile 构建（约 3-5 分钟）..."
     --include-package=rikkelivo \
     --include-package=click \
     --include-package=rich \
+    --include-package=questionary \
+    --include-package=prompt_toolkit \
+    --include-package=wcwidth \
+    --include-package-data=rikkelivo \
     src/rikkelivo/cli.py
 
 echo "✓ 产物: $OUT_DIR/rikkelivo"

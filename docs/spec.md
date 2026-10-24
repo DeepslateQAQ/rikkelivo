@@ -1,219 +1,139 @@
-# rikkelivo 转换规格说明
+# rikkelivo 转换规格
 
-本文档描述 rikkelivo 在 RikkaHub 与 Kelivo（cuplivo）之间的完整转换规格。
-所有映射均以两个项目源码与真实备份为据。
+本规格描述当前实现（三应用、原生格式优先）。所有格式常量来自固定上游提交，
+schema 资源随包分发；转换过程不联网。
 
-## 1. 转换范围总览
+## 1. 支持的输入
 
-| 类别 | 双向 | 说明 |
-|---|---|---|
-| 会话与消息 | ✓ | 含思考内容（reasoning）、用量、翻译、时间戳 |
-| 附件 | ✓ | Kelivo `[image:]/[file:]` 标记 ↔ RikkaHub image/document part |
-| 多版本分支 | ✓ | `groupId + version` ↔ `message_node`（select_index） |
-| 群聊 | ✓ | Kelivo/cuplivo 独有；经 `x_rikkelivo` 侧车字段无损往返 |
-| 工具调用记录 | ✓ | RikkaHub `tool` part ↔ Kelivo `toolEvents` |
-| 数据库 | → | 生成与 RikkaHub 自身备份一致的 Room v24 SQLite |
-| 提供商/模型 | ✓ | 内置匹配 + uuid5 确定性映射；显示名透传 |
-| 助手 | ✓ | 含当前助手切换、记忆、技能、头像 |
-| MCP | ✓ | 内置服务补全/移除；headers、工具参数双向 |
-| TTS / ASR / 快捷短语 / 提示注入 / 世界书 / 搜索服务 | ✓ | `*_v1` ↔ 原生列表 |
-| 用户信息 | ✓ | 昵称/头像 |
-| S3 / WebDAV | ✓ | 备份目的地配置 |
-| Skills | ✓ | `skills/` 目录原样拷贝 |
-| 模型体系 | ✓ | 默认聊天/快速/标题/建议/翻译/OCR/压缩模型 |
+| 来源 | 载荷 | 识别与校验 |
+| --- | --- | --- |
+| RikkaHub | `rikka_hub.db` + `settings.json` + 附件 | Room 24–31：实际 `user_version`、完整实体表/列/索引/外键、存在的 Room identity；WAL 按 SQLite 指针重放，SHM 不恢复 |
+| Kelivo / Cuplivo | `manifest.json` + `settings.json` + `database/kelivo.db` | archive 2/3；SQLite 1–3 精确 schema；manifest 全文件 bytes/SHA256、conversation/message 计数、scope、payloadKind |
+| Kelivo / Cuplivo | `chats.json` v1/v2 | 根版本、必填值、日期、重复 ID、owner 冲突、toolEvents/geminiThoughtSigs、groupChats/groupMembers |
+| Cuplivo | `conversations.jsonl` / `messages.jsonl` / `chats_meta.json` | `format_version=2`、固定文件名、逐行 wrapper、声明计数 |
+| 任意 | 仅 `settings.json`（可带附件） | 靠应用特征键区分家族；裸 `{}` 不猜 |
 
-## 2. 聊天记录
+同包出现互斥载荷（如 `rikka_hub.db` 与 `chats.json`）直接失败；损坏的
+manifest 不会回落到旧 JSON；未来版本只有声明了可读兼容性才接受，并按当前
+已知结构投影并报告未知表/列。
 
-### 2.1 消息
+## 2. 输出
 
-文本/思考内容/用量/翻译全部保留。时间戳：两边均为无时区 ISO（毫秒），
-透传；RikkaHub reasoning part 的 `createdAt`/`finishedAt` 为 Instant（需
-时区），Kelivo 的 naive 时间按转换机本地时区转 UTC-Z。
+| 目标 | latest | legacy |
+| --- | --- | --- |
+| RikkaHub | Room 31（3.1.0） | Room 24（2.4.11/2.5.0 基线） |
+| Kelivo | archive 3 + SQLite 3，`appVersion="rikkelivo/<版本>"` | `chats.json` v1 |
+| Cuplivo | archive 3 + SQLite 3 | `chats.json` v2 |
 
-### 2.2 附件
+- Room 输出建完整目标 schema、精确 identity、重建 FTS、关闭的单文件数据库，
+  并做逐表 integrity_check 与 foreign_key_check。
+- archive 3 输出真实 manifest：`formatVersion/minimumReadableFormatVersion`、
+  `payloadKind`、`scope`（15 类）、`businessEntityRowIds`、entries bytes/hash、
+  database block 计数；不附加旧 `chats.json`/`deleted.json`。
+- 仅设置源保持仅设置：不创建空数据库。空但存在的聊天域仍写出 0 行数据库。
+- 旧 JSON 输出：`settings.json` + `chats.json`（+ Cuplivo 的 `deleted.json`）
+  与目标支持的附件；官方 JSON1 写完整 messageIds 与 ordinal selection，
+  Cuplivo JSON2 写代表 messageIds 与 actual version。
 
-Kelivo 把附件以标记内嵌在消息 content 中：`[image:<路径>]`、
-`[file:<路径>|<文件名>|<MIME>]`。RikkaHub 用 image/document part
-（`url` 为 `file:///…/upload/<文件名>` 形式）。
+## 3. 选择与分支
 
-- K2R：解析标记为 part；路径改写为 RikkaHub 的托管目录前缀
-  （`file:///data/user/0/me.rerere.rikkahub/files/upload/…`）。
-- R2K：part 转回标记；保留路径尾段（`/upload/` 等），Kelivo 的
-  `SandboxPathResolver.fix()` 会映射到其数据目录。
+- 原生 SQL：`version_selections_json` / `conversation_rows.truncate_index`
+  使用实际 revision version 与逻辑 group 槽位。
+- RikkaHub：节点 `select_index`；输出 `nodes="[]"`，消息只在 `message_node`。
+- 历史 JSON1：官方 importer 把 selection 当 ordinal；历史 Cuplivo JSON2 与
+  JSONL2 使用实际 version。根 `version` 不能单独证明方言：无群聊字段且消息
+  候选无法判定时，转换拒绝猜测；两种解释得到不同 message 即报歧义。
+- 历史 JSON 的 `truncateIndex` 先按源消息顺序折算为逻辑 group 边界；输出
+  legacy 时反映射回对应消息序列的首索引。
+- 群聊/并行 subgroup/speaker：目标不支持时按
+  `(conversation, groupId, subgroupId, speaker)` 拆成稳定 lineage 并线性化；
+  仅在包含原选中 identity 的 lineage 保留选择，其余取各自末修订，报告并行
+  语义被线性化。RikkaHub/官方 JSON1 对助手正文加入发送者引用。
+- 上下文边界：RikkaHub 最后选中消息的 `isContextCheckpoint` ↔ Kelivo
+  `truncate_index`；无法表达的空上下文不造空消息，保留可见历史并报告。
 
-### 2.3 多版本分支
+## 4. 设置、模型与认证
 
-- K2R：Kelivo 的 `groupId + version` 对应一个 `message_node`（节点内按
-  version 排序，`select_index` 取 `versionSelections[groupId]`，缺省最后
-  一条）；`ConversationEntity.nodes` 恒为 `[]`（与 RikkaHub 自身行为一致）。
-- R2K：每个节点一个 group（节点 id 为 groupId），节点内消息按序为
-  version 0..n，`versionSelections[groupId] = select_index`（>0 时），
-  `messageIds` 只保留每组 version-0 代表消息。
+- 提供商/模型按 `(provider preference key, logical model ID)` 配对；
+  `apiModelId` 只是请求名，只有在本 provider 内唯一时才作为别名。未限定的
+  同名模型只有在全部保留 provider 中唯一时才解析。
+- 无法映射的 active 引用被清空并报告，不偷偷换同名 provider/model。
+- ChatGPT/Grok 是原生 OAuth 账户的明确例外：按目标原生类型双向映射
+  access/refresh/expiry/account/email/plan；Kelivo 侧 `sessionId` 是新的本地
+  缓存身份，`requiresLogin=false`。缺失 refresh、未知 expiry、或源
+  `requiresLogin=true` 时目标保持 signed-out，不伪造凭据。Kimi/Claude OAuth
+  在 RikkaHub 没有对应账户类型，按 unsupported 丢弃。
+- 活动 service-account、活动多 key、未知认证 kind 在没有等价结构时丢弃
+  provider 与受影响模型；未启用的备用 key 只警告，不丢 provider。诊断绝不
+  打印 token/密钥。
+- Room 输出重放上游 Settings V1–V5：MCP 短类型、preset parts 短类型且递归
+  tool.output、assistant quickMessages → 全局列表 + ID、移除旧注入开关并清
+  关联、balanceOption → quotaQuery（legacy 目标反向降级）。
+- 现代 Kelivo 写真实使用的键：`title_*_v1`、`suggestion_*_v1`、
+  `translate_*_v1`、`ocr_*_v1`、`compress_model_v1`、
+  `tts_selected_service_id_v1`、`asr_selected_service_id_v1`、
+  `per_chat_model_enabled_v1`；`assistants_v1` 外层仍是 JSON 字符串，内层
+  presetMessages 为数组。
 
-### 2.4 群聊（Kelivo/cuplivo 独有）
+## 5. 会话原生子集
 
-RikkaHub 无群聊概念，降级迁移：
+- 会话模型固定：RikkaHub `config.chatModelId` ↔ Kelivo
+  `chat_model_provider`/`chat_model_id`，并确保
+  `per_chat_model_enabled_v1` 使绑定生效。
+- workspace / skills / 自定义 prompt 写 native extras：
+  `workspace.id`、`workspace.cwd`、`skills.ids`、`prompt.system`、
+  `prompt.instructionIds`、`prompt.worldBookIds`。保持源权限门：助手未允许
+  会话系统提示词时不把内容搬到目标 extras。
+- 源 `[]` 技能列表表示显式禁用，不转成 all；RikkaHub 显式技能名列表在目标
+  写成这些 ID。MCP 会话关联可保存，但生成时仍可能按助手取工具，明确报告
+  不等价。
 
-- K2R：群聊会话导入为普通会话；每条助手消息内容前加 Markdown 引用块
-  （`> **发送者**:`），并在消息 JSON 附加 `x_rikkelivo` 侧车字段
-  （`kind`/`speaker`/`contentOriginal`/`groupId`/`subgroupId`/`version`/
-  `isPreset`，首条消息另带 `groupChat`/`groupMembers` 元数据）。RikkaHub
-  解码 `ignoreUnknownKeys=true`，字段被忽略、显示正常。
-- R2K：带侧车字段的消息还原原始内容、`speakerAssistantId`，重建
-  `groupChats`/`groupMembers` 与 `conversationKind: "group"`。
-- 转换后请在 RikkaHub 中把群聊会话指派给一个助手。
-- 注意：若在 RikkaHub 中重新生成/编辑这些消息，侧车字段会被 RikkaHub
-  自身的序列化丢弃，转回 Kelivo 后引用块退化为普通文本。
+## 6. 记忆
 
-### 2.5 工具调用记录
+- 同家族原生对象保持目标可表达的 type/scope/status。
+- RikkaHub 24–27 → 28+ 只做上游 `legacyMemoriesToProfile` 变换（按旧整数 id
+  排序、trim 行拼单行、frontmatter、`- [stated]`）；这条原生迁移的
+  `updated_at` 使用迁移时间并报告。RH 28–31 → 31 原样保留所有 Markdown 文件
+  （含非 pinned 路径），不聚合。
+- RikkaHub → Kelivo：每个非空白 MD 文件一条 typed entry；`/profile.md` →
+  identity，其余 → instruction；content 原样。共享 `__global__` 只复制到原本
+  `useGlobalMemory=true` 的助手，保持私有范围；使用 global 的助手的私有文件
+  转为 archived；空白文件丢弃并报告。
+- Kelivo → RikkaHub：active global + 该助手 active private 写入每个助手自己
+  的库，`useGlobalMemory=false`；archived 丢弃报告；没有助手的 global 丢弃。
+  typed entries 每组最多两篇 `/profile.md`、`/preferences.md`，按
+  workflow/voice/instruction 排序，正文原样，updated_at 取最大值；>48KiB 保留
+  正文并警告。已有 RH markdown 不经过该聚合器。
+- 降到 legacy RikkaHub 简单记忆时，每个可见文档/active entry 一条 content。
 
-Kelivo 以 `toolEvents: {messageId: [{id, name, arguments, content, metadata?}]}`
-记录工具调用（数据在 `tool_event_rows` 表，导出到 chats.json）。
+## 7. 独立数据类别
 
-- R2K：RikkaHub `tool` part → `toolEvents[messageId]`（`arguments` 解析
-  JSON、`output` 文本拼接为 `content`）。不再丢弃。
-- K2R：`toolEvents` → `tool` part（含 `approvalState`/`metadata`）。
+| 类别 | 同家族 | 跨家族 / 无目标能力 |
+| --- | --- | --- |
+| 媒体创作库 | 保留 session/node/record 与 `media_creation/` 文件 | 按数量报告丢弃，不伪造聊天/文件 |
+| 独立翻译历史 | 保留原始行，不截断 | 报告丢弃；消息 translation 照常 |
+| 工作区 | 保留配置、绑定与真实文件 | 只迁移元数据，报告目录/rootfs/授权未恢复 |
+| 独立用量 ledger | 原样保留，空表也权威 | 报告丢弃；消息自身 token 保留 |
+| favorite / folder / GenMedia / consolidation | 保留 | 报告丢弃或 source 缺资产 |
+| tombstone / 生成任务 | 原生类型保留 | 报告丢弃 |
 
-## 3. 数据库（RikkaHub 侧，K2R 生成）
+RikkaHub 目标没有 ledger 时，只用可证实 CHAT 的消息 whole-turn 用量重建
+（role=assistant 且 prompt/completion 至少一个 >0），报告
+`usage_history_reconstructed`；已有 ledger 绝不补建。
 
-与 RikkaHub 自身备份一致：
+## 8. 附件与工具
 
-- 完整 Room v24 schema（`app/schemas/…/24.json`）；`PRAGMA user_version =
-  24`；`room_master_table` 写入真实身份哈希 `0ea1aaebfa031c7995c45a1e35822e1a`
-  —— 恢复后 Room 直接打开，不触发校验或迁移。
-- 消息全文索引 `message_fts`（fts5，`simple` 分词，缺失时回退
-  `unicode61`）填充文本/节点/会话/标题/更新时间，恢复即可搜索。
-- `managed_files` 上传登记表按 `upload/` 目录生成（mime 由文件名推断，
-  时间取 zip 条目时间）。
-- 助手记忆写入 `MemoryEntity` 表。
+- 一次预分配映射：同家族保留安全相对路径；到 RikkaHub 时 upload/images/
+  avatars 等映射到扁平 `upload/`，名字为源完整路径 SHA256 前 16 位 + 安全
+  basename；到 Kelivo 时使用 `kelivo-file:///` 分段 percent-encoding。
+- 缺失本地附件保留可读引用并报告；Kelivo 侧标 `unavailable`。远程 URL 原样。
+- 工具部分保持出现顺序；Kelivo `tool_call` ↔ RikkaHub tool（input JSON
+  字符串、output 递归 parts）。服务端工具在 Kelivo 侧只保留可读输出并报告
+  调用语义丢失。
+- provider artifact 按 `(revision, kind, payload)` 保留；同家族保留所有
+  kind，历史/跨家族只保留 Gemini 思考签名，其余按 kind 报告丢弃。
 
-## 4. 设置桥（尽力而为，有损）
+## 9. CLI 与发布
 
-### 4.1 共享标量键
-
-同名同型键逐字拷贝（`themeId`、`dynamicColor`、`assistantId`、
-`chatModelId`、`fastModelId`、各类 prompt、`webServer*` 等）。
-
-### 4.2 提示词变量
-
-- RikkaHub `PlaceholderTransformer` 同时渲染 `{{key}}` 与 `{key}`，键集：
-  `char`/`user`/`nickname`/`cur_date`/`model_id`/`model_name`/`locale`/
-  `timezone`/`system_version`/`device_info`/`battery_level`。
-- Kelivo（cuplivo）系统提示词只渲染单括号 `{key}`，键集：
-  `assistant_name`/`nickname`/`cur_date`/`cur_time`/`cur_datetime`/`model_id`/
-  `model_name`/`locale`/`timezone`/`system_version`/`device_info`/
-  `battery_level`。
-- 转换：`{{char}} ↔ {assistant_name}`、`{{user}} ↔ {nickname}`，同名键在
-  双括号/单括号之间互转，未知键原样保留；`messageTemplate` 的
-  `{{ message }}` 两边一致，不做改动。作用于 5 个共享 prompt 键、助手
-  `systemPrompt`、提示注入与世界书条目内容。
-
-### 4.3 容器键映射（`*_v1` ↔ 原生列表）
-
-| Kelivo（JSON 字符串） | RikkaHub（原生列表） |
-|---|---|
-| `provider_configs_v1` | `providers` |
-| `assistants_v1` | `assistants` |
-| `mcp_servers_v1` | `mcpServers` |
-| `tts_services_v1` | `ttsProviders` |
-| `quick_phrases_v1` | `quickMessages` |
-| `instruction_injections_v1` | `modeInjections` |
-| `world_books_v1` | `lorebooks` |
-| `search_services_v1` | `searchServices` |
-
-- **内置提供商**按 `(baseUrl, providerType)` / RikkaHub UUID 互相匹配，
-  复用对方内置 ID（避免重复创建）；自定义提供商用 uuid5 确定性映射
-  （保证 id 均为合法 UUID，避免 kotlinx/Uuid 解析崩溃）。
-- **内置 MCP**：Kelivo 自带 `@kelivo/fetch`、`@kelivo/subagent`（启用）、
-  `@kelivo/filesystem`（默认禁用）。R2K 自动补全三个内置；K2R 移除它们。
-  MCP 请求头（RikkaHub `[{"first","second"}]` ↔ Kelivo Map）与工具参数
-  （JSON Schema ↔ `params`）双向转换；Kelivo transport 枚举
-  （`sse/http/stdio/inmemory`）↔ RikkaHub（`sse/streamable_http`）。
-- 模型 ID 互解：Kelivo 模型名 ↔ RikkaHub 模型 UUID；显示名
-  （`displayName` ↔ `modelOverrides.name`）透传（如「小赢鲸 Deepseek V4
-  Flash」不退化）。
-- **搜索服务**：类型兼容（`bing_local`/`tavily`/`exa`/`jina`/`ollama` 等）
-  转成 `search_services_v1`（legacy `apiKey` 迁入 `apiKeys` 列表），同步
-  `search_enabled_v1`/`search_selected_v1`/`search_common_v1` 使搜索生效；
-  应用独有类型（如 RikkaHub `custom_js`、Kelivo `duckduckgo`）丢弃并警告。
-
-### 4.4 助手
-
-- 字段白名单转换，Kelivo 独有字段（`memoryMode`/`proactiveCare*` 等）丢弃
-  或默认值。
-- **当前助手**：R2K 时 `current_assistant_id_v1` 取 RikkaHub 默认助手
-  `assistantId`（会话实际使用的助手），否则取首个转换助手；K2R 时
-  `assistantId` 取 Kelivo `current_assistant_id_v1`。
-- **记忆**：RikkaHub `MemoryEntity` ↔ Kelivo `assistant_memories_v1`
-  （`{id, assistantId, content}`），assistantId 按转换后 id 映射。
-- **技能**：`enabledSkills ↔ skillIds`（技能名列表）映射。
-
-### 4.5 模型体系（fastModelId 等）
-
-RikkaHub 模型键：`chatModelId`（默认聊天）、`fastModelId`（快速，标题/建议
-未指定时的回退）、`titleModelId`、`suggestionModelId`、`translateModeId`、
-`ocrModelId`、`compressModelId`。
-Kelivo 对应：`selected_model_v1`（当前模型，一切回退的根）与
-`title_model_v1`/`suggestion_model_v1`/`translate_model_v1`/`ocr_model_v1`/
-`compress_model_v1`（`"providerKey::modelId"` 格式）。
-
-- R2K：默认聊天模型 → `selected_model_v1`；标题/建议未指定则写入快速
-  模型；翻译/OCR/压缩逐一解析映射。
-- K2R：反向解析回各模型键；`chatModelId` 取 Kelivo 当前模型；`fastModelId`
-  优先取标题模型（与 R2K 往返一致）否则取当前模型——保证引用始终可解析。
-- `imageGenerationModelId`：Kelivo 无对应键（图像生成走工具能力），保持
-  遗留键拷贝。
-
-### 4.6 用户信息 / S3 / WebDAV
-
-- 用户信息：`displaySetting.userNickname/userAvatar` ↔ `user_name`/
-  `avatar_type`/`avatar_value`（emoji/url/file 三类头像）。
-- S3：`s3Config` ↔ `s3_config_v1`（endpoint/region/bucket/accessKeyId/
-  secretAccessKey/pathStyle 等）。
-- WebDAV：`webDavConfig` ↔ `webdav_config_v1`（url/username/password/path/
-  includeChats/includeFiles）。
-
-### 4.7 类型安全（关键）
-
-Kelivo 的恢复通过其自定义 `prefs.restore()` 逐键写入，只接受
-`String/bool/int/double/List<String>`。RikkaHub 侧的对象数组键
-（`searchServices`/`asrProviders`/`lorebooks`/`assistantTags`/
-`customThemes` 等镜像键）在 Kelivo 设置中一律保持空列表（数据走 `*_v1`
-字符串），避免整个设置恢复被中断。
-
-### 4.8 目标应用独有键
-
-（如 RikkaHub `displaySetting`/`s3Config`、Kelivo `display_*_v1` 系列）
-使用目标应用自身默认值。
-
-## 5. Kelivo 导入 MCP 的 BUG（重要）
-
-Kelivo 启动时对启用中的 MCP 服务自动连接（`unawaited`），`connect()` 成功
-后执行 `refreshTools() → _persist()`。恢复流程（`data_sync.dart`）通过
-`prefs.restore()` 写入设置后**不重载 mcp_provider**，若自动连接在恢复完成
-之后才返回，`_persist()` 会用启动时缓存的旧内存覆盖刚导入的
-`mcp_servers_v1`——表现为 MCP 服务「永远写不进去」，而其他设置正常。
-
-**规避**：导入前在 MCP 设置页禁用所有服务（含内置），导入（选「完全覆盖」）
-并自动重启后重新启用。转换器在检测到自定义 MCP 时会输出此警告。
-
-## 6. 时区约定
-
-`chats.json` 时间戳为无时区本地时间；与 RikkaHub 的 epoch 毫秒互转按转换机
-本地时区解释。两次转换在同一时区下往返稳定。
-
-## 7. 测试
-
-```bash
-uv run pytest
-```
-
-覆盖：真实备份双向转换、群聊无损往返、附件标记往返、多版本分支、Room
-身份哈希、工具事件往返、MCP 内置/headers/schema、模型体系映射、设置类型
-安全、用户信息/记忆/技能/S3/WebDAV。
-
-## 8. 参考实现
-
-转换策略参考 [jwbb903/Rikkahub2Kelivo](https://github.com/jwbb903/Rikkahub2Kelivo)
-（内置提供商映射、groupId 分组建节点、modelIDMap），并修复其两个问题：
-生成的 SQLite 写入假 Room 身份哈希（真实应用首次打开即崩溃）、不处理群聊。
+见 README：源文件优先、纯参数模式零提问、TTY 向导、退出码 0/1/2/130、
+stderr 损失报告、原子发布、源别名保护、弃用命令隐藏但保留语法。

@@ -12,9 +12,21 @@ as long as both runs happen in one timezone.
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 
 _MS_FMT = "%Y-%m-%dT%H:%M:%S.%f"
+_ISO_FRACTION_RE = re.compile(r"\.(\d+)(?=(?:Z|[+-]\d{2}:?\d{2})?$)")
+
+
+def _normalize_fraction(text: str) -> str:
+    """Normalize fractional seconds to six digits for Python 3.10."""
+
+    def _replace(match: re.Match) -> str:
+        digits = (match.group(1) + "000000")[:6]
+        return "." + digits
+
+    return _ISO_FRACTION_RE.sub(_replace, text)
 
 
 def iso_to_ms(value: str | None) -> int | None:
@@ -28,6 +40,7 @@ def iso_to_ms(value: str | None) -> int | None:
     text = value.strip()
     if text.endswith("Z"):
         text = text[:-1] + "+00:00"
+    text = _normalize_fraction(text)
     try:
         dt = datetime.fromisoformat(text)
     except ValueError:
@@ -54,6 +67,7 @@ def iso_to_utc_z(value: str | None) -> str | None:
     if not value:
         return None
     text = value.strip()
+    text = _normalize_fraction(text)
     if text.endswith("Z"):
         return text
     try:
