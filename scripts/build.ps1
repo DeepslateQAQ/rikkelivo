@@ -1,5 +1,6 @@
 ﻿# 一键构建 rikkelivo Windows 单文件版（Nuitka onefile）。
-# 需本机已安装 Windows 版 Python 3.12 + uv（或 pip）。用法: .\scripts\build.ps1
+# 需本机已安装 Windows 版 Python 3.13+、MSVC（Visual Studio Build Tools）与 uv（或 pip）。
+# 用法: .\scripts\build.ps1
 $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $PSScriptRoot
@@ -19,7 +20,7 @@ if (Test-Path .venv\Scripts\python.exe) {
     }
 }
 if (-not $py) {
-    Write-Error "未找到 Windows 版 Python，请先安装 Python 3.12"
+    Write-Error "未找到 Windows 版 Python，请先安装 Python 3.13+"
     exit 1
 }
 
@@ -62,7 +63,7 @@ if ($LASTEXITCODE -ne 0) { exit 1 }
 
 Write-Host "[INFO] Nuitka onefile 构建中（约 3-5 分钟）..."
 $nuitkaArgs = @(
-    "--mingw64",
+    "--msvc=latest",
     "--assume-yes-for-downloads",
     "--output-dir=build\win",
     "--onefile",

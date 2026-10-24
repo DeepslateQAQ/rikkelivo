@@ -101,7 +101,8 @@ scripts/build.sh       # Linux / macOS → build/linux|macos/rikkelivo
 scripts/build.ps1      # Windows → build\win\rikkelivo.exe
 ```
 
-Linux 构建需 `patchelf`，macOS/Windows 不需要；产物为 Nuitka onefile，
+Linux 构建需 `patchelf`，Windows 需 MSVC（Visual Studio Build Tools），
+macOS 不需要额外依赖；产物为 Nuitka onefile，
 已包含 Questionary / prompt_toolkit / wcwidth 与 `rikkelivo/schemas` 资源，
 不依赖目标机器安装 Python。
 
