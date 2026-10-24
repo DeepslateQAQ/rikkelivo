@@ -2204,8 +2204,8 @@ def _legacy_message_dict(message: Msg, conv: Conv, cuplivo: bool,
                 f"历史 JSON 无法表达的消息部件 {part.raw_kind or part.kind}"))
     content = "\n\n".join(texts)
     if markers:
-        content = f"{content}\n{'\n'.join(markers)}" if content else "\n".join(
-            markers)
+        marker_text = "\n".join(markers)
+        content = f"{content}\n{marker_text}" if content else marker_text
     if events:
         tool_events[message.id] = events
     signature = next((artifact.payload for artifact in message.artifacts
